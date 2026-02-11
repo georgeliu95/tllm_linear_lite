@@ -13,12 +13,29 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+/*
+ * [Standalone FP4-only modification]
+ *
+ * This file is derived from TensorRT-LLM's tensorrt_llm/kernels/quantization.h.
+ *
+ * Changes from the original:
+ *   - Replaced includes: tensorrt_llm/common/config.h, tensorrt_llm/common/quantization.h
+ *     -> tllm_compat.cuh (standalone compatibility header)
+ *   - Removed: invokeQuantization<T>()          (INT8 scalar quantization)
+ *   - Removed: invokePerTokenQuantization<T>()   (per-token INT8/FP8 quantization, depends on QuantMode)
+ *   - Removed: invokeMxFP8Quantization<T>()      (MXFP8 block quantization)
+ *   - Kept:    invokeFP4Quantization<T>()         (FP4 block quantization)
+ *   - Kept:    invokeBlockScaleInterleave()        (SF layout conversion: linear -> swizzled)
+ *   - Kept:    invokeBlockScaleInterleaveReverse() (SF layout conversion: swizzled -> linear)
+ *   - Kept:    computePerTokenGlobalScaleForFP4Quantization<T>() (per-token global scale for NVFP4)
+ *   - Kept:    QuantizationSFLayout, BlockScaleQuantizationType, PadUpFn,
+ *              computeSwizzledLayoutSFSize, computeLinearLayoutSFSize
+ */
+
  #pragma once
 
- #include "tensorrt_llm/common/config.h"
- #include "tensorrt_llm/common/quantization.h"
- #include <cuda_fp16.h>
- #include <cuda_runtime.h>
+#include "tllm_compat.cuh"
  
  TRTLLM_NAMESPACE_BEGIN
  enum class QuantizationSFLayout
@@ -61,36 +78,23 @@
      return static_cast<int64_t>(totalRow) * totalColumn;
  }
  
- namespace kernels
- {
- 
- template <typename T>
- void invokeQuantization(
-     int8_t* dst, T const* src, int64_t const size, float const* scalePtr, cudaStream_t stream = 0, int maxGirdSize = 0);
- 
- template <typename T, typename QuantT>
- void invokePerTokenQuantization(QuantT* dst, T const* src, int64_t const numRows, int64_t const numCols,
-     float const* clampPtr, float* scalePtr, float* sumPtr, tensorrt_llm::common::QuantMode quantMode,
-     cudaStream_t stream = 0);
- 
- template <typename T, int SF_VEC_SIZE = 16>
- void invokeFP4Quantization(int b, int m, int n, T const* input, float const* globalScale, int64_t* output,
-     int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream = 0);
- 
- template <typename T>
- void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, int64_t* output, int32_t* SFOuput,
-     QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream = 0);
- 
- void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded, uint8_t const* SFIn, uint8_t* SFOutput,
-     int multiProcessorCount, cudaStream_t stream = 0);
- 
- void invokeBlockScaleInterleaveReverse(
-     int b, int m, int n, uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount, cudaStream_t stream = 0);
- 
- template <typename T>
- void computePerTokenGlobalScaleForFP4Quantization(int b, int m, int n, T const* input, int const* tokensPerBatch,
-     float* globalScale, int multiProcessorCount, cudaStream_t stream = 0);
- 
- } // namespace kernels
+namespace kernels
+{
+
+template <typename T, int SF_VEC_SIZE = 16>
+void invokeFP4Quantization(int b, int m, int n, T const* input, float const* globalScale, int64_t* output,
+    int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream = 0);
+
+void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded, uint8_t const* SFIn, uint8_t* SFOutput,
+    int multiProcessorCount, cudaStream_t stream = 0);
+
+void invokeBlockScaleInterleaveReverse(
+    int b, int m, int n, uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount, cudaStream_t stream = 0);
+
+template <typename T>
+void computePerTokenGlobalScaleForFP4Quantization(int b, int m, int n, T const* input, int const* tokensPerBatch,
+    float* globalScale, int multiProcessorCount, cudaStream_t stream = 0);
+
+} // namespace kernels
  
  TRTLLM_NAMESPACE_END
