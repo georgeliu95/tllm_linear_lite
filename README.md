@@ -1,6 +1,6 @@
 # tllm_linear_lite
 
-Standalone modules for the NVFP4 GEMM pipeline, extracted from [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) with **no TensorRT-LLM dependency**. Includes FP4 quantization CUDA kernels, Triton-based amax, and (TODO) NVFP4 GEMM.
+Standalone modules for the NVFP4 GEMM pipeline, extracted from [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) with **no TensorRT-LLM dependency**. Includes FP4 quantization, NVFP4 GEMM (cuBLASLt + CUDA core), and Triton-based amax.
 
 ## Provided Ops
 
@@ -11,30 +11,42 @@ Standalone modules for the NVFP4 GEMM pipeline, extracted from [TensorRT-LLM](ht
 | `torch.ops.tllm_linear_lite.fp4_quantize` | `(input, globalScale?, sfVecSize, sfUseUE8M0, isSfSwizzledLayout) -> (Tensor, Tensor)` | Block-wise FP4 (E2M1) quantization with FP8 E4M3 scale factors |
 | `torch.ops.tllm_linear_lite.calculate_nvfp4_global_scale` | `(input, tokensPerBatch?) -> Tensor` | Per-token global scale computation for NVFP4 |
 
-### Amax (Triton kernel)
+### GEMM (CUDA extension)
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `triton_amax` | `(input, config?) -> Tensor` | Global absolute maximum with autotuning (two-stage reduction) |
-| `triton_amax_partial` | `(input, config?) -> Tensor` | Block-level partial amax (first stage only, for fused pipelines) |
+| Op | Signature | Description |
+|----|-----------|-------------|
+| `torch.ops.tllm_linear_lite.cublaslt_fp4_gemm` | `(a, b, scale_a, scale_b, alpha, out_dtype?) -> Tensor` | cuBLASLt FP4 BlockScaleGemm, all shapes |
+| `torch.ops.tllm_linear_lite.cuda_core_nvfp4_gemm` | `(a, b, scale_a, scale_b, alpha, out_dtype?) -> Tensor` | CUDA core FP4 GEMM, M <= 16 (decode phase) |
+
+### Python API
+
+| Function | Module | Description |
+|----------|--------|-------------|
+| `nvfp4_gemm(...)` | `tllm_linear_lite.nvfp4_gemm` | Unified dispatch: auto-selects backend by shape (cuda_core for M<=16, else cuBLASLt) |
+| `triton_amax(...)` | `tllm_linear_lite.amax` | Global absolute maximum with autotuning |
 
 ## Project Structure
 
 ```
 tllm_linear_lite/
 ├── setup.py                        # Build script (torch CUDAExtension)
-├── tllm_linear_lite/
-│   ├── __init__.py                 # Loads the .so and registers ops
+├── 3rdparty/
+│   └── cutlass/                    # CUTLASS v4.3.0 (git submodule, header-only)
+├── tllm_linear_lite/               # Python package
+│   ├── __init__.py                 # Loads .so, registers ops
+│   ├── nvfp4_gemm.py              # Unified GEMM dispatch (auto/cublaslt/cuda_core)
 │   └── amax/
 │       └── triton_amax.py          # Triton-based amax kernel (autotuned)
-├── quantize/
-│   ├── tllm_compat.cuh             # Standalone compat header (replaces all TRT-LLM common/)
-│   ├── quantization.h              # Kernel declarations (FP4-only)
-│   ├── quantization.cuh            # CUDA kernel implementations
-│   ├── quantization.cu             # Host wrappers + template instantiations
-│   └── fp4_quantize_op.cu          # PyTorch op registration (TORCH_LIBRARY)
+├── quantize/                       # FP4 quantization CUDA sources
+│   ├── tllm_compat.cuh             # Standalone compat header (replaces TRT-LLM common/)
+│   ├── quantization.{h,cuh,cu}     # FP4 quantization kernels
+│   └── fp4_quantize_op.cu          # PyTorch op registration
+├── gemm/                           # NVFP4 GEMM CUDA sources
+│   ├── cublaslt_fp4_gemm.cpp       # cuBLASLt BlockScaleGemm backend
+│   └── cuda_core_nvfp4_gemm.cu     # CUDA core backend (M<=16, uses CUTLASS + CUB)
 └── tests/
-    └── test_quantize.py            # Correctness + performance tests
+    ├── test_quantize.py            # Quantize correctness + perf
+    └── test_nvfp4_gemm.py          # GEMM correctness (vs nn.Linear) + perf
 ```
 
 ## Requirements
@@ -49,7 +61,10 @@ tllm_linear_lite/
 ```bash
 cd tllm_linear_lite/
 
-# Build for Blackwell (B200)
+# Init CUTLASS submodule (header-only, needed by cuda_core backend)
+git submodule update --init --depth 1
+
+# Build for Blackwell (B200/B100)
 TORCH_CUDA_ARCH_LIST="10.0a" pip install -e . --no-build-isolation
 
 # Or with uv
@@ -76,9 +91,22 @@ global_scale = 448.0 * 6.0 / x.abs().amax().float()
 fp4_packed, scale_factors = torch.ops.tllm_linear_lite.fp4_quantize(
     x, global_scale, 16, False, True
 )
+```
 
-# Per-token global scale
-per_token_scale = torch.ops.tllm_linear_lite.calculate_nvfp4_global_scale(x, None)
+### NVFP4 GEMM
+
+```python
+from tllm_linear_lite.nvfp4_gemm import nvfp4_gemm
+
+# Auto-dispatch: cuda_core for M<=16, cuBLASLt otherwise
+output = nvfp4_gemm(
+    act_fp4, weight_fp4, act_sf, weight_sf, alpha,
+    output_dtype=torch.bfloat16,
+    backend="auto",  # or "cublaslt", "cuda_core"
+)
+
+# Add bias (epilogue fusion planned as follow-up)
+output = output + bias
 ```
 
 ### Triton Amax
@@ -87,51 +115,60 @@ per_token_scale = torch.ops.tllm_linear_lite.calculate_nvfp4_global_scale(x, Non
 from tllm_linear_lite.amax.triton_amax import triton_amax
 
 x = torch.randn(14400, 6144, device="cuda", dtype=torch.bfloat16)
-
-# Autotuned global amax
 amax = triton_amax(x)
-
-# With specific kernel config
-amax = triton_amax(x, config="B8192_W32")
 ```
 
 ## Testing
 
 ```bash
-# FP4 quantize: correctness + performance
+# FP4 quantize: correctness (vs PyTorch reference) + performance
 python tests/test_quantize.py
 python tests/test_quantize.py --shape 4096,4096 --dtype float16
 
-# FP4 quantize: compare with TensorRT-LLM (requires tensorrt_llm installed)
+# NVFP4 GEMM: correctness (vs nn.Linear) + performance, with/without bias
+python tests/test_nvfp4_gemm.py
+python tests/test_nvfp4_gemm.py --m 1 --n 4096 --k 4096 --backend cuda_core
+python tests/test_nvfp4_gemm.py --m 128 --n 4096 --k 4096 --backend cublaslt
+
+# Cross-validate with TensorRT-LLM (requires tensorrt_llm installed)
 python tests/test_quantize.py --compare-trtllm
+python tests/test_nvfp4_gemm.py --compare-trtllm
 
-# FP4 quantize: NCU profiling
-ncu --set full -o quantize_report python tests/test_quantize.py --ncu
-
-# Triton amax: correctness + benchmark
+# Triton amax
 python tllm_linear_lite/amax/triton_amax.py
-python tllm_linear_lite/amax/triton_amax.py --shape 14400,6144 --dtype bfloat16
+
+# NCU profiling
+ncu --set full -o quantize_report python tests/test_quantize.py --ncu
 ```
 
 ## What Changed from TensorRT-LLM
 
-The CUDA kernels (`quantization.{h,cuh,cu}`) are derived from TensorRT-LLM's `tensorrt_llm/kernels/quantization.*`. Changes:
+### Quantize kernels (`quantize/`)
 
-- **Replaced** 8 TRT-LLM internal headers with a single `tllm_compat.cuh` standalone compat header
-- **Removed** non-FP4 code: INT8 scalar quantization, per-token INT8/FP8 quantization, MXFP8 quantization
-- **Kept** FP4 block quantization, block scale interleave, and per-token global scale for FP4
-- **Added** `fp4_quantize_op.cu` for PyTorch op registration under the `tllm_linear_lite` namespace
+Derived from `tensorrt_llm/kernels/quantization.*`:
+- **Replaced** 8 TRT-LLM internal headers with a single `tllm_compat.cuh`
+- **Removed** non-FP4 code (INT8, per-token INT8/FP8, MXFP8)
+- **Kept** FP4 block quantization, block scale interleave, per-token global scale
+- See comment blocks at top of each `.h` / `.cuh` / `.cu` file for detailed diff
 
-See the comment block at the top of each `.h` / `.cuh` / `.cu` file for the detailed diff.
+### GEMM kernels (`gemm/`)
+
+- **cuBLASLt** (`cublaslt_fp4_gemm.cpp`): self-contained rewrite of `cublasFp4ScaledMM.cpp` + `cublasMMWrapper.cpp`, with inline handle management (no `opUtils.h` dependency)
+- **CUDA core** (`cuda_core_nvfp4_gemm.cu`): extracted from `cudaCoreGemmNVFP4.cu` + `cudaNvfp4MM.cpp`, replaced `NvInferRuntime.h`, `SizeType32`, `TllmToCutlassTypeAdapter` with local equivalents
 
 ## Roadmap
 
 - [x] `fp4_quantize` -- NVFP4 block quantization (CUDA kernel)
 - [x] `calculate_nvfp4_global_scale` -- Per-token global scale (CUDA kernel)
 - [x] `triton_amax` -- Global amax reduction (Triton kernel)
-- [ ] NVFP4 GEMM -- FP4 matrix multiplication (CUTLASS / cuBLASLt)
-- [ ] FourOverSix -- Support FourOverSix in quantize module
-- [ ] End-to-end NVFP4 Linear -- Fused quantize + GEMM module
+- [x] `cublaslt_fp4_gemm` -- cuBLASLt NVFP4 GEMM (all shapes)
+- [x] `cuda_core_nvfp4_gemm` -- CUDA core NVFP4 GEMM (M<=16, decode)
+- [x] `nvfp4_gemm` -- Unified Python dispatch layer
+- [ ] CUTLASS NVFP4 GEMM -- Best performance backend (40+ template instantiations)
+- [ ] Cute DSL NVFP4 GEMM -- Python-based Blackwell kernels
+- [ ] Bias epilogue fusion -- Fuse bias into cuBLASLt GEMM epilogue
+- [ ] FourOverSix -- Adaptive block scaling in quantize module
+- [ ] End-to-end NVFP4 Linear -- Fused quantize + GEMM `nn.Module`
 
 ## License
 

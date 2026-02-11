@@ -1,5 +1,5 @@
 """
-Build script for tllm_linear_lite FP4 quantization CUDA extension.
+Build script for tllm_linear_lite NVFP4 CUDA extension.
 
 Usage:
     pip install -e .          # editable install
@@ -7,8 +7,8 @@ Usage:
 
 After building, use the ops as:
     import tllm_linear_lite
-    torch.ops.tllm_linear_lite.fp4_quantize(input, global_scale, sf_vec_size=16)
-    torch.ops.tllm_linear_lite.calculate_nvfp4_global_scale(input, None)
+    torch.ops.tllm_linear_lite.fp4_quantize(...)
+    torch.ops.tllm_linear_lite.cublaslt_fp4_gemm(...)
 """
 
 import os
@@ -22,14 +22,26 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 # ---------------------------------------------------------------------------
 ROOT_DIR = Path(__file__).parent.resolve()
 QUANTIZE_DIR = ROOT_DIR / "quantize"
+GEMM_DIR = ROOT_DIR / "gemm"
 
 # ---------------------------------------------------------------------------
-# CUDA source files
+# Source files
 # ---------------------------------------------------------------------------
 sources = [
+    # Quantize ops
     str(QUANTIZE_DIR / "quantization.cu"),
     str(QUANTIZE_DIR / "fp4_quantize_op.cu"),
+    # GEMM ops
+    str(GEMM_DIR / "cublaslt_fp4_gemm.cpp"),
+    str(GEMM_DIR / "cuda_core_nvfp4_gemm.cu"),
 ]
+
+# ---------------------------------------------------------------------------
+# CUTLASS (vendored, header-only)
+# ---------------------------------------------------------------------------
+CUTLASS_DIR = ROOT_DIR / "3rdparty" / "cutlass"
+CUTLASS_INCLUDE = CUTLASS_DIR / "include"
+CUTLASS_TOOLS_INCLUDE = CUTLASS_DIR / "tools" / "util" / "include"
 
 # ---------------------------------------------------------------------------
 # Compile flags
@@ -58,8 +70,13 @@ nvcc_flags = [
 if "TORCH_CUDA_ARCH_LIST" not in os.environ:
     os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0;8.6;8.9;9.0;10.0a;12.0a"
 
-# Include path for our headers
-include_dirs = [str(QUANTIZE_DIR)]
+# Include paths
+include_dirs = [
+    str(QUANTIZE_DIR),
+    str(GEMM_DIR),
+    str(CUTLASS_INCLUDE),
+    str(CUTLASS_TOOLS_INCLUDE),
+]
 
 # ---------------------------------------------------------------------------
 # Extension
@@ -69,6 +86,7 @@ ext_modules = [
         name="tllm_linear_lite._C",
         sources=sources,
         include_dirs=include_dirs,
+        libraries=["cublasLt"],
         extra_compile_args={
             "cxx": cxx_flags,
             "nvcc": nvcc_flags,
@@ -82,7 +100,7 @@ ext_modules = [
 setup(
     name="tllm_linear_lite",
     version="0.1.0",
-    description="Standalone FP4 quantization ops (no TensorRT-LLM dependency)",
+    description="Standalone NVFP4 quantize + GEMM ops (no TensorRT-LLM dependency)",
     packages=find_packages(),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
