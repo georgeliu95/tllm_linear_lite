@@ -1,6 +1,6 @@
 # tllm_linear_lite
 
-Standalone modules for the NVFP4 GEMM pipeline, extracted from [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) with **no TensorRT-LLM dependency**. Includes FP4 quantization, NVFP4 GEMM (CUTLASS + cuBLASLt + CUDA core), and Triton-based amax.
+Standalone modules for the NVFP4 GEMM pipeline, extracted from [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) with **no TensorRT-LLM dependency**. Includes FP4 quantization, NVFP4 GEMM (Cute DSL + CUTLASS + cuBLASLt + CUDA core), and Triton-based amax.
 
 ## Provided Ops
 
@@ -23,7 +23,8 @@ Standalone modules for the NVFP4 GEMM pipeline, extracted from [TensorRT-LLM](ht
 
 | Function | Module | Description |
 |----------|--------|-------------|
-| `nvfp4_gemm(...)` | `tllm_linear_lite.nvfp4_gemm` | Unified dispatch: auto-selects backend (cuda_core M<=16, cutlass K%32==0, else cuBLASLt) |
+| `nvfp4_gemm(...)` | `tllm_linear_lite.nvfp4_gemm` | Unified dispatch: auto-selects backend (cuda_core M<=16, cutedsl/cutlass K%32==0, else cuBLASLt) |
+| `CuteDSLNVFP4Runner` | `tllm_linear_lite.cutedsl.runner` | Cute DSL JIT runner with SimpleTuner (SM100/103 only, bf16) |
 | `triton_amax(...)` | `tllm_linear_lite.amax` | Global absolute maximum with autotuning |
 
 ## Project Structure
@@ -35,7 +36,15 @@ tllm_linear_lite/
 │   └── cutlass/                    # CUTLASS v4.3.0 (git submodule, header-only)
 ├── tllm_linear_lite/               # Python package
 │   ├── __init__.py                 # Loads .so, registers ops
-│   ├── nvfp4_gemm.py              # Unified GEMM dispatch (auto/cutlass/cublaslt/cuda_core)
+│   ├── nvfp4_gemm.py              # Unified GEMM dispatch (auto/cutedsl/cutlass/cublaslt/cuda_core)
+│   ├── cutedsl/                    # Cute DSL backend (Python-only, optional)
+│   │   ├── __init__.py             # IS_CUTLASS_DSL_AVAILABLE check
+│   │   ├── runner.py               # CuteDSLNVFP4Runner (simplified from TRT-LLM)
+│   │   ├── tuner.py                # SimpleTuner (minimal tactic profiler)
+│   │   └── kernels/                # Copied from TRT-LLM (no modifications)
+│   │       ├── dense_blockscaled_gemm_persistent.py  # Blackwell GEMM kernel (~2000 lines)
+│   │       ├── custom_pipeline.py  # PipelineTmaUmma, PipelineUmmaAsync
+│   │       └── utils.py            # make_ptr, griddepcontrol helpers
 │   └── amax/
 │       └── triton_amax.py          # Triton-based amax kernel (autotuned)
 ├── quantize/                       # FP4 quantization CUDA sources
@@ -79,6 +88,10 @@ TORCH_CUDA_ARCH_LIST="10.0a" pip install -e . --no-build-isolation
 
 # Or with uv
 TORCH_CUDA_ARCH_LIST="10.0a" uv pip install -e . --system --break-system-packages --no-build-isolation
+
+# Optional: install Cute DSL backend dependencies (Blackwell SM100/SM103 only)
+pip install nvidia-cutlass-dsl>=4.3.4 cuda-core apache-tvm-ffi==0.1.6
+# Or: pip install -e ".[cutedsl]"
 ```
 
 > **Note**: `sm_100a` (not `sm_100`) is required. The `a` suffix enables architecture-specific
@@ -108,11 +121,11 @@ fp4_packed, scale_factors = torch.ops.tllm_linear_lite.fp4_quantize(
 ```python
 from tllm_linear_lite.nvfp4_gemm import nvfp4_gemm
 
-# Auto-dispatch: cuda_core for M<=16, cutlass for K%32==0, else cuBLASLt
+# Auto-dispatch: cuda_core for M<=16, cutedsl/cutlass for K%32==0, else cuBLASLt
 output = nvfp4_gemm(
     act_fp4, weight_fp4, act_sf, weight_sf, alpha,
     output_dtype=torch.bfloat16,
-    backend="auto",  # or "cutlass", "cublaslt", "cuda_core"
+    backend="auto",  # or "cutedsl", "cutlass", "cublaslt", "cuda_core"
 )
 
 # Add bias (epilogue fusion planned as follow-up)
@@ -139,6 +152,7 @@ python tests/test_quantize.py --shape 4096,4096 --dtype float16
 python tests/test_nvfp4_gemm.py
 python tests/test_nvfp4_gemm.py --m 1 --n 4096 --k 4096 --backend cuda_core
 python tests/test_nvfp4_gemm.py --m 128 --n 4096 --k 4096 --backend cutlass
+python tests/test_nvfp4_gemm.py --m 128 --n 4096 --k 4096 --backend cutedsl  # requires nvidia-cutlass-dsl
 python tests/test_nvfp4_gemm.py --m 128 --n 4096 --k 4096 --backend cublaslt
 
 # Cross-validate with TensorRT-LLM (requires tensorrt_llm installed)
@@ -168,6 +182,12 @@ Derived from `tensorrt_llm/kernels/quantization.*`:
 - **cuBLASLt** (`cublaslt_fp4_gemm.cpp`): self-contained rewrite of `cublasFp4ScaledMM.cpp` + `cublasMMWrapper.cpp`, with inline handle management (no `opUtils.h` dependency)
 - **CUDA core** (`cuda_core_nvfp4_gemm.cu`): extracted from `cudaCoreGemmNVFP4.cu` + `cudaNvfp4MM.cpp`, replaced `NvInferRuntime.h`, `SizeType32`, `TllmToCutlassTypeAdapter` with local equivalents
 
+### Cute DSL kernels (`tllm_linear_lite/cutedsl/`)
+
+- **Kernel files** (`kernels/`): copied as-is from `_torch/cute_dsl_kernels/blackwell/` -- no TRT-LLM imports (only cutlass DSL + cuda-python)
+- **Runner** (`runner.py`): simplified from `CuteDSLNVFP4BlackwellLinear`, removed TRT-LLM `TunableRunner` ABC and `AutoTuner` dependency
+- **Tuner** (`tuner.py`): ~100-line `SimpleTuner` replaces TRT-LLM's 700-line `AutoTuner`
+
 See comment blocks at top of each file for detailed diff from TRT-LLM originals.
 
 ## Roadmap
@@ -179,7 +199,7 @@ See comment blocks at top of each file for detailed diff from TRT-LLM originals.
 - [x] `cuda_core_nvfp4_gemm` -- CUDA core NVFP4 GEMM (M<=16, decode)
 - [x] `nvfp4_gemm` -- Unified Python dispatch layer
 - [x] `cutlass_fp4_gemm` -- CUTLASS 3.x NVFP4 GEMM (SM100/103/120, best perf)
-- [ ] Cute DSL NVFP4 GEMM -- Python-based Blackwell kernels
+- [x] Cute DSL NVFP4 GEMM -- Python-based Blackwell kernels (SM100/103, JIT compiled)
 - [ ] Bias epilogue fusion -- Fuse bias into cuBLASLt GEMM epilogue
 - [ ] FourOverSix -- Adaptive block scaling in quantize module
 - [ ] End-to-end NVFP4 Linear -- Fused quantize + GEMM `nn.Module`

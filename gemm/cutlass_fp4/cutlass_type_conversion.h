@@ -1,8 +1,29 @@
 /*
- * Minimal type conversion adapters for CUTLASS FP4 GEMM.
+ * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
  *
- * Derived from TensorRT-LLM cutlass_type_conversion.h (Apache 2.0).
- * Stripped of NvInferRuntime.h dependency.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * [Standalone -- minimal rewrite, based on TRT-LLM]
+ *
+ * Minimal type conversion adapters for CUTLASS FP4 GEMM.
+ * Derived from TensorRT-LLM's kernels/cutlass_kernels/cutlass_type_conversion.h (Apache 2.0).
+ *
+ * Changes from the original:
+ *   - Removed all NvInferRuntime.h / nvinfer1::DataType dependencies
+ *   - Kept only TllmToCutlassTypeAdapter and CutlassToTllmTypeAdapter
+ *     for half, __nv_bfloat16, __nv_fp8_e4m3/e5m2, __nv_fp4_e2m1
  */
 
 #pragma once

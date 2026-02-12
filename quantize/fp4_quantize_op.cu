@@ -1,11 +1,32 @@
 /*
+ * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * [Standalone -- new file, based on TRT-LLM]
+ *
  * PyTorch Op wrapper for FP4 quantization kernels.
+ * Based on TensorRT-LLM's thop/fp4Quantize.cpp (Apache 2.0 License).
  *
- * Registers the following ops under the "tllm_linear_lite" namespace:
- *   - torch.ops.tllm_linear_lite.fp4_quantize
- *   - torch.ops.tllm_linear_lite.calculate_nvfp4_global_scale
- *
- * Based on TensorRT-LLM fp4Quantize.cpp (Apache 2.0 License).
+ * Changes from the original:
+ *   - Replaced all TRT-LLM includes (thUtils.h, cudaUtils.h) with local equivalents
+ *   - Replaced CHECK_TH_CUDA/CHECK_INPUT macros with TORCH_CHECK
+ *   - Replaced FLOAT4_E2M1X2/SF_DTYPE with local constexpr
+ *   - Replaced getMultiProcessorCount() with local implementation
+ *   - No userbuffers support
+ *   - Registered as torch.ops.tllm_linear_lite.{fp4_quantize, calculate_nvfp4_global_scale}
  */
 
 #include <torch/extension.h>

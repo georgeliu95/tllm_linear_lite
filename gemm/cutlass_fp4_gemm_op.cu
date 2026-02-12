@@ -1,10 +1,33 @@
 /*
+ * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * [Standalone -- new file, based on TRT-LLM]
+ *
  * PyTorch Op wrapper for CUTLASS NVFP4 GEMM.
+ * Based on TensorRT-LLM's thop/fp4Gemm.cpp (Apache 2.0 License).
+ *
+ * Changes from the original:
+ *   - Simplified: only NVFP4 (W4A4_NVFP4_NVFP4), no MXFP8
+ *   - No FP4GemmRunner class / autotuner, uses default config heuristic
+ *   - No userbuffers support
+ *   - Registered as torch.ops.tllm_linear_lite.cutlass_fp4_gemm
  *
  * Provides:
  *   torch.ops.tllm_linear_lite.cutlass_fp4_gemm(a, b, scale_a, scale_b, alpha, out_dtype?) -> Tensor
- *
- * Uses CutlassFp4GemmRunner<T, W4A4_NVFP4_NVFP4> from the extracted CUTLASS templates.
  */
 
 #include <torch/extension.h>

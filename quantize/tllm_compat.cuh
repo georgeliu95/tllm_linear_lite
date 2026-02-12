@@ -1,11 +1,32 @@
 /*
- * Standalone compatibility header for TensorRT-LLM quantization kernels.
+ * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
  *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * [Standalone -- new file]
+ *
+ * Standalone compatibility header for TensorRT-LLM quantization kernels.
  * This header replaces all TensorRT-LLM common/ headers with minimal,
  * self-contained implementations of only the utilities used by the
  * FP4 quantization kernels. No TensorRT-LLM dependency required.
  *
- * Extracted from TensorRT-LLM (Apache 2.0 License).
+ * Replaces: tensorrt_llm/common/{config,assert,cudaTypeUtils,cudaUtils,
+ *           quantTypeUtils,reduceKernelUtils,envUtils}.{h,cuh}
+ * Provides: TRTLLM_NAMESPACE_BEGIN/END, TLLM_CHECK, TLLM_CUDA_CHECK,
+ *           TypeConverter, cuda_abs, cuda_max, blockReduceMaxV2,
+ *           getEnvEnablePDL, getMultiProcessorCount, getSMVersion
  */
 
 #pragma once

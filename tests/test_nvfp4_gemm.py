@@ -1,3 +1,17 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 test_nvfp4_gemm.py - NVFP4 GEMM Correctness Test
 
@@ -31,6 +45,7 @@ from typing import List, Dict, Any
 
 import tllm_linear_lite  # noqa: F401
 from tllm_linear_lite.nvfp4_gemm import nvfp4_gemm
+from tllm_linear_lite.cutedsl import IS_CUTLASS_DSL_AVAILABLE
 
 
 # ============================================================================
@@ -274,7 +289,7 @@ def main():
     parser.add_argument("--dtype", type=str, default="bfloat16",
                         choices=["float16", "bfloat16"])
     parser.add_argument("--backend", type=str, default="all",
-                        choices=["all", "cutlass", "cublaslt", "cuda_core", "auto"])
+                        choices=["all", "cutedsl", "cutlass", "cublaslt", "cuda_core", "auto"])
     parser.add_argument("--no-bias", action="store_true", help="Skip bias tests")
     parser.add_argument("--compare-trtllm", action="store_true",
                         help="Compare with TensorRT-LLM nvfp4_gemm")
@@ -296,7 +311,10 @@ def main():
     for m, n, k in DEFAULT_SHAPES:
         # Determine backends for this shape
         if args.backend == "all":
-            backends = ["cutlass", "cublaslt"]
+            backends = []
+            if IS_CUTLASS_DSL_AVAILABLE and k % 32 == 0 and dtype == torch.bfloat16:
+                backends.append("cutedsl")
+            backends.extend(["cutlass", "cublaslt"])
             if m <= 16:
                 backends.append("cuda_core")
         else:
