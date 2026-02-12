@@ -34,7 +34,16 @@ sources = [
     # GEMM ops
     str(GEMM_DIR / "cublaslt_fp4_gemm.cpp"),
     str(GEMM_DIR / "cuda_core_nvfp4_gemm.cu"),
+    str(GEMM_DIR / "cutlass_fp4_gemm_op.cu"),
+    # CUTLASS FP4 GEMM template instantiations (slow to compile, ~50 kernels each)
+    str(GEMM_DIR / "cutlass_fp4" / "fp4_gemm_fp16.cu"),
+    str(GEMM_DIR / "cutlass_fp4" / "fp4_gemm_bf16.cu"),
 ]
+
+# ---------------------------------------------------------------------------
+# CUTLASS FP4 GEMM headers
+# ---------------------------------------------------------------------------
+CUTLASS_FP4_DIR = GEMM_DIR / "cutlass_fp4"
 
 # ---------------------------------------------------------------------------
 # CUTLASS (vendored, header-only)
@@ -57,6 +66,8 @@ nvcc_flags = [
     "--use_fast_math",
     "-DENABLE_BF16",
     "-DENABLE_FP8",
+    "-DENABLE_FP4",
+    "-DUSING_OSS_CUTLASS_FP4_GEMM",
     # Suppress annoying warnings from CUDA headers
     "--expt-relaxed-constexpr",
     "--expt-extended-lambda",
@@ -74,6 +85,7 @@ if "TORCH_CUDA_ARCH_LIST" not in os.environ:
 include_dirs = [
     str(QUANTIZE_DIR),
     str(GEMM_DIR),
+    str(CUTLASS_FP4_DIR),
     str(CUTLASS_INCLUDE),
     str(CUTLASS_TOOLS_INCLUDE),
 ]
