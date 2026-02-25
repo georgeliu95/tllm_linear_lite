@@ -18,7 +18,7 @@ amax.py - Triton-based Absolute Maximum (Amax) Implementation
 High-performance global amax reduction using Triton kernels with autotuning.
 
 Usage:
-    from tensorrt_llm._torch.modules.amax import triton_amax
+    from tllm_linear_lite.amax.triton_amax import triton_amax
     
     # Basic usage - returns global amax as scalar tensor
     global_amax = triton_amax(input_tensor)

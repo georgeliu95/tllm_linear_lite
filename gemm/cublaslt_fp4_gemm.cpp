@@ -189,6 +189,7 @@ namespace
 /// @param scale_a   Activation scale factors (FP8 E4M3 as uint8, swizzled)
 /// @param scale_b   Weight scale factors (FP8 E4M3 as uint8, swizzled)
 /// @param alpha     Global scale tensor [1] (float32, device)
+/// @param bias      Optional bias tensor [n] (same dtype as output, or empty)
 /// @param algo      Optional algorithm (nullptr for heuristic default)
 void cublaslt_fp4_gemm_impl(
     torch::Tensor& out,
@@ -197,6 +198,7 @@ void cublaslt_fp4_gemm_impl(
     torch::Tensor const& scale_a,
     torch::Tensor const& scale_b,
     torch::Tensor const& alpha,
+    std::optional<at::Tensor> const& bias = std::nullopt,
     cublasLtMatmulAlgo_t const* algo = nullptr)
 {
     int32_t m = a.sizes()[0];
@@ -262,6 +264,18 @@ void cublaslt_fp4_gemm_impl(
         operationDesc, CUBLASLT_MATMUL_DESC_D_SCALE_MODE, &scaleMode32F, sizeof(scaleMode32F)));
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
         operationDesc, CUBLASLT_MATMUL_DESC_D_OUT_SCALE_MODE, &scaleMode32F, sizeof(scaleMode32F)));
+
+    // --- Set bias epilogue if bias is provided ---
+    if (bias.has_value() && bias->defined())
+    {
+        void* bias_ptr = const_cast<void*>(bias->data_ptr());
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_ptr, sizeof(void*)));
+
+        cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+    }
 
     // C/D scale pointers = nullptr
     void const* null_ptr = nullptr;
@@ -333,13 +347,14 @@ void cublaslt_fp4_gemm_impl(
 // PyTorch Op
 // ============================================================================
 
-/// cuBLASLt FP4 GEMM PyTorch op.
+/// cuBLASLt FP4 GEMM PyTorch op with optional bias epilogue fusion.
 ///
 /// @param a          Activation FP4 packed [m, k/2] (uint8)
 /// @param b          Weight FP4 packed [n, k/2] (uint8)
 /// @param scale_a    Activation scale factors (FP8 E4M3, swizzled layout)
 /// @param scale_b    Weight scale factors (FP8 E4M3, swizzled layout)
 /// @param alpha      Global alpha [1] float32 tensor (device)
+/// @param bias       Optional bias [n] tensor (same dtype as output). Fused in cuBLASLt epilogue.
 /// @param out_dtype  Optional output dtype (default: bfloat16)
 /// @return           Output tensor [m, n]
 at::Tensor cublaslt_fp4_gemm(
@@ -348,6 +363,7 @@ at::Tensor cublaslt_fp4_gemm(
     at::Tensor const& scale_a,
     at::Tensor const& scale_b,
     at::Tensor const& alpha,
+    std::optional<at::Tensor> const& bias,
     std::optional<c10::ScalarType> out_dtype)
 {
     TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
@@ -359,10 +375,16 @@ at::Tensor cublaslt_fp4_gemm(
     int64_t m = a.sizes()[0];
     int64_t n = b.sizes()[0];
 
+    if (bias.has_value() && bias->defined())
+    {
+        TORCH_CHECK(bias->is_cuda(), "bias must be a CUDA tensor");
+        TORCH_CHECK(bias->numel() == n, "bias must have size [n]");
+    }
+
     at::ScalarType dtype = out_dtype.value_or(at::ScalarType::BFloat16);
     at::Tensor out = at::empty({m, n}, a.options().dtype(dtype));
 
-    cublaslt_fp4_gemm_impl(out, a, b, scale_a, scale_b, alpha);
+    cublaslt_fp4_gemm_impl(out, a, b, scale_a, scale_b, alpha, bias);
 
     return out;
 }
@@ -375,7 +397,7 @@ TORCH_LIBRARY_FRAGMENT(tllm_linear_lite, m)
 {
     m.def(
         "cublaslt_fp4_gemm(Tensor a, Tensor b, Tensor scale_a, Tensor scale_b, "
-        "Tensor alpha, ScalarType? out_dtype=None) -> Tensor");
+        "Tensor alpha, Tensor? bias=None, ScalarType? out_dtype=None) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(tllm_linear_lite, CUDA, m)

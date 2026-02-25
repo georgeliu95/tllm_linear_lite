@@ -16,14 +16,15 @@ Standalone modules for the NVFP4 GEMM pipeline, extracted from [TensorRT-LLM](ht
 | Op | Signature | Description |
 |----|-----------|-------------|
 | `torch.ops.tllm_linear_lite.cutlass_fp4_gemm` | `(a, b, scale_a, scale_b, alpha, out_dtype?) -> Tensor` | CUTLASS 3.x FP4 GEMM, best perf (K%32==0, N%32==0) |
-| `torch.ops.tllm_linear_lite.cublaslt_fp4_gemm` | `(a, b, scale_a, scale_b, alpha, out_dtype?) -> Tensor` | cuBLASLt FP4 BlockScaleGemm, all shapes |
+| `torch.ops.tllm_linear_lite.cublaslt_fp4_gemm` | `(a, b, scale_a, scale_b, alpha, bias?, out_dtype?) -> Tensor` | cuBLASLt FP4 BlockScaleGemm, all shapes, supports fused bias epilogue |
 | `torch.ops.tllm_linear_lite.cuda_core_nvfp4_gemm` | `(a, b, scale_a, scale_b, alpha, out_dtype?) -> Tensor` | CUDA core FP4 GEMM, M <= 16 (decode phase) |
 
 ### Python API
 
 | Function | Module | Description |
 |----------|--------|-------------|
-| `nvfp4_gemm(...)` | `tllm_linear_lite.nvfp4_gemm` | Unified dispatch: auto-selects backend (cuda_core M<=16, cutedsl/cutlass K%32==0, else cuBLASLt) |
+| `nvfp4_gemm(...)` | `tllm_linear_lite.nvfp4_gemm` | Unified dispatch: `cuda_core` if M<=16 and N%2==0 and K%16==0; else `cutedsl` (Blackwell SM100/103 + bf16 + K%32==0 + cutlass-dsl); else `cutlass` if K%32==0 and N%32==0; else `cublaslt` |
+| `fp4_quantize(...)` | `tllm_linear_lite.quantize` | Unified quantize wrapper (`backend="tllm"` or optional `backend="fouroversix"`) |
 | `CuteDSLNVFP4Runner` | `tllm_linear_lite.cutedsl.runner` | Cute DSL JIT runner with SimpleTuner (SM100/103 only, bf16) |
 | `triton_amax(...)` | `tllm_linear_lite.amax` | Global absolute maximum with autotuning |
 
@@ -121,15 +122,17 @@ fp4_packed, scale_factors = torch.ops.tllm_linear_lite.fp4_quantize(
 ```python
 from tllm_linear_lite.nvfp4_gemm import nvfp4_gemm
 
-# Auto-dispatch: cuda_core for M<=16, cutedsl/cutlass for K%32==0, else cuBLASLt
+# Auto-dispatch:
+# - cuda_core: M<=16 and N%2==0 and K%16==0
+# - cutedsl: Blackwell (SM100/103), bf16 output, K%32==0, and cutlass-dsl installed
+# - cutlass: K%32==0 and N%32==0
+# - fallback: cublaslt
 output = nvfp4_gemm(
     act_fp4, weight_fp4, act_sf, weight_sf, alpha,
+    bias=bias,  # fused in cublaslt; post-add in other backends
     output_dtype=torch.bfloat16,
     backend="auto",  # or "cutedsl", "cutlass", "cublaslt", "cuda_core"
 )
-
-# Add bias (epilogue fusion planned as follow-up)
-output = output + bias
 ```
 
 ### Triton Amax
@@ -148,16 +151,17 @@ amax = triton_amax(x)
 python tests/test_quantize.py
 python tests/test_quantize.py --shape 4096,4096 --dtype float16
 
-# NVFP4 GEMM: correctness (vs nn.Linear) + performance, with/without bias
+# NVFP4 GEMM: correctness (vs nn.Linear), with/without bias
 python tests/test_nvfp4_gemm.py
-python tests/test_nvfp4_gemm.py --m 1 --n 4096 --k 4096 --backend cuda_core
-python tests/test_nvfp4_gemm.py --m 128 --n 4096 --k 4096 --backend cutlass
-python tests/test_nvfp4_gemm.py --m 128 --n 4096 --k 4096 --backend cutedsl  # requires nvidia-cutlass-dsl
-python tests/test_nvfp4_gemm.py --m 128 --n 4096 --k 4096 --backend cublaslt
+python tests/test_nvfp4_gemm.py --backend cuda_core
+python tests/test_nvfp4_gemm.py --backend cutlass
+python tests/test_nvfp4_gemm.py --backend cutedsl  # requires nvidia-cutlass-dsl
+python tests/test_nvfp4_gemm.py --backend cublaslt
+python tests/test_nvfp4_gemm.py --backend auto --no-bias
 
 # Cross-validate with TensorRT-LLM (requires tensorrt_llm installed)
 python tests/test_quantize.py --compare-trtllm
-python tests/test_nvfp4_gemm.py --compare-trtllm
+python tests/test_nvfp4_gemm.py --compare-trtllm  # placeholder, currently prints SKIP
 
 # Triton amax
 python tllm_linear_lite/amax/triton_amax.py
@@ -200,8 +204,10 @@ See comment blocks at top of each file for detailed diff from TRT-LLM originals.
 - [x] `nvfp4_gemm` -- Unified Python dispatch layer
 - [x] `cutlass_fp4_gemm` -- CUTLASS 3.x NVFP4 GEMM (SM100/103/120, best perf)
 - [x] Cute DSL NVFP4 GEMM -- Python-based Blackwell kernels (SM100/103, JIT compiled)
-- [ ] Bias epilogue fusion -- Fuse bias into cuBLASLt GEMM epilogue
-- [ ] FourOverSix -- Adaptive block scaling in quantize module
+- [x] cuBLASLt bias epilogue -- `nvfp4_gemm(..., bias=...)` uses fused epilogue on cublaslt backend
+- [x] Optional fouroversix wrapper -- `tllm_linear_lite.quantize.fp4_quantize(..., backend="fouroversix")`
+- [ ] Bias epilogue fusion for non-cuBLASLt backends (cutlass/cuda_core/cutedsl)
+- [ ] FourOverSix adaptive block scaling in native CUDA quantize path
 - [ ] End-to-end NVFP4 Linear -- Fused quantize + GEMM `nn.Module`
 
 ## License

@@ -127,27 +127,29 @@ def create_nvfp4_linear_test_data(
 
 
 def run_nvfp4_gemm(data: dict, backend: str, output_dtype: torch.dtype) -> torch.Tensor:
-    """Run NVFP4 GEMM with the specified backend, including bias addition."""
+    """Run NVFP4 GEMM with the specified backend, including bias.
+
+    Bias is passed to nvfp4_gemm which handles it appropriately:
+    - cuBLASLt: fused in epilogue (no extra kernel launch)
+    - Other backends: added post-GEMM (output += bias)
+    """
+    bias = data["bias"]  # None if no bias
+
     if backend == "cuda_core":
-        gemm_out = nvfp4_gemm(
+        return nvfp4_gemm(
             data["act_fp4_lin"], data["weight_fp4"],
             data["act_sf_lin"], data["weight_sf"],
             data["alpha"],
-            output_dtype=output_dtype, backend="cuda_core",
+            output_dtype=output_dtype, bias=bias, backend="cuda_core",
         )
     else:
-        # cutlass / cuBLASLt both use SWIZZLED layout for scale factors
-        gemm_out = nvfp4_gemm(
+        # cutlass / cuBLASLt / cutedsl all use SWIZZLED layout for scale factors
+        return nvfp4_gemm(
             data["act_fp4"], data["weight_fp4"],
             data["act_sf"], data["weight_sf"],
             data["alpha"],
-            output_dtype=output_dtype, backend=backend,
+            output_dtype=output_dtype, bias=bias, backend=backend,
         )
-
-    if data["bias"] is not None:
-        gemm_out = gemm_out + data["bias"]
-
-    return gemm_out
 
 
 # ============================================================================

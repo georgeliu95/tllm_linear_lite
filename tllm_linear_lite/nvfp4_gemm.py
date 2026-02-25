@@ -58,11 +58,12 @@ def nvfp4_gemm(
     weight_sf: torch.Tensor,
     alpha: torch.Tensor,
     output_dtype: Optional[torch.dtype] = None,
+    bias: Optional[torch.Tensor] = None,
     backend: str = "auto",
 ) -> torch.Tensor:
     """Unified NVFP4 GEMM dispatch.
 
-    Computes: output[M, N] = alpha * (act_fp4[M, K] @ weight_fp4[N, K]^T)
+    Computes: output[M, N] = alpha * (act_fp4[M, K] @ weight_fp4[N, K]^T) + bias
     with per-16-element FP8 E4M3 block scale factors.
 
     Args:
@@ -74,6 +75,8 @@ def nvfp4_gemm(
         weight_sf:    Weight scale factors (FP8 E4M3 as uint8, SWIZZLED layout)
         alpha:        Global scale [1] float32 tensor (device)
         output_dtype: Output dtype (default: bfloat16). Supports fp16, bf16, fp32.
+        bias:         Optional bias [N] tensor. Fused in cuBLASLt epilogue; for other
+                      backends, added post-GEMM (output += bias).
         backend:      Backend selection:
                       - "auto": auto-select (cutedsl if available on Blackwell, cuda_core for M<=16,
                         cutlass for K%32==0 & N%32==0, else cublaslt)
@@ -128,7 +131,10 @@ def nvfp4_gemm(
                 "cutedsl backend requires nvidia-cutlass-dsl. "
                 "Install with: pip install nvidia-cutlass-dsl>=4.3.4 cuda-core apache-tvm-ffi==0.1.6"
             )
-        return _run_cutedsl(act_fp4, weight_fp4, act_sf, weight_sf, alpha, M, N, K)
+        out = _run_cutedsl(act_fp4, weight_fp4, act_sf, weight_sf, alpha, M, N, K)
+        if bias is not None:
+            out = out + bias  # post-GEMM bias (no epilogue fusion for cutedsl yet)
+        return out
 
     elif backend == "cutlass":
         if K % 32 != 0 or N % 32 != 0:
@@ -136,10 +142,13 @@ def nvfp4_gemm(
                 f"cutlass backend requires K%32==0 and N%32==0, got K={K}, N={N}"
             )
         # CUTLASS expects SWIZZLED layout for both scale factors
-        return torch.ops.tllm_linear_lite.cutlass_fp4_gemm(
+        out = torch.ops.tllm_linear_lite.cutlass_fp4_gemm(
             act_fp4, weight_fp4, act_sf, weight_sf, alpha,
             out_scalar_type,
         )
+        if bias is not None:
+            out = out + bias  # post-GEMM bias (no epilogue fusion for cutlass yet)
+        return out
 
     elif backend == "cuda_core":
         if M > _CUDA_CORE_MAX_M:
@@ -147,15 +156,20 @@ def nvfp4_gemm(
                 f"cuda_core backend requires M <= {_CUDA_CORE_MAX_M}, got M={M}"
             )
         # cuda_core expects LINEAR layout for act_sf
-        return torch.ops.tllm_linear_lite.cuda_core_nvfp4_gemm(
+        out = torch.ops.tllm_linear_lite.cuda_core_nvfp4_gemm(
             act_fp4, weight_fp4, act_sf, weight_sf, alpha,
             out_scalar_type,
         )
+        if bias is not None:
+            out = out + bias  # post-GEMM bias (no epilogue fusion for cuda_core)
+        return out
 
     elif backend == "cublaslt":
         # cuBLASLt expects SWIZZLED layout for both scale factors
+        # Bias is fused in cuBLASLt epilogue when provided
         return torch.ops.tllm_linear_lite.cublaslt_fp4_gemm(
             act_fp4, weight_fp4, act_sf, weight_sf, alpha,
+            bias,  # fused in epilogue (None if not provided)
             out_scalar_type,
         )
 
