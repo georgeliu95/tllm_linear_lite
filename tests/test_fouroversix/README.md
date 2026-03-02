@@ -1,21 +1,22 @@
-# fouroversix Standalone Example
+# fouroversix Example
 
-Standalone example demonstrating [fouroversix](https://github.com/mit-han-lab/fouroversix)
-FP4 (NVFP4) quantization, independent of tllm_linear_lite.
+Demonstrates [fouroversix](https://github.com/mit-han-lab/fouroversix) FP4 (NVFP4)
+quantization with end-to-end GEMM verification (cuBLASLt via tllm_linear_lite).
 
 ## Files
 
 ```
 test_fouroversix/
-├── fouroversix_example.py   # Standalone example script
+├── fouroversix_example.py   # Quantize + GEMM example script
 ├── fouroversix.patch        # Local changes to QuantizedTensor (.to() method)
 └── README.md                # This file
 ```
 
 ## Prerequisites
 
-- CUDA GPU (Blackwell recommended; PyTorch backend works on any GPU)
+- Blackwell GPU (cuBLASLt FP4 GEMM requires SM100+)
 - PyTorch with CUDA support
+- **tllm_linear_lite** installed (provides cuBLASLt FP4 GEMM backend)
 
 ## Setup
 
@@ -47,11 +48,14 @@ The included `fouroversix.patch` modifies
 ## Usage
 
 ```bash
-# Default: 4096x4096, bfloat16, all scale rules
+# Default: input=[4096,4096], weight=[4096,4096], bfloat16, all scale rules
 python fouroversix_example.py
 
-# Custom shape and dtype
-python fouroversix_example.py --shape 14400,6144 --dtype bfloat16
+# Custom M,N,K shape
+python fouroversix_example.py --shape 128,4096,4096   # M=128, N=4096, K=4096
+
+# M,K format (N defaults to K)
+python fouroversix_example.py --shape 4096,4096
 
 # Benchmark only (skip accuracy verification)
 python fouroversix_example.py --skip-verify
@@ -67,9 +71,15 @@ The example runs three stages:
 1. **Basic Usage Demo** — Minimal quantize → dequantize round-trip showing
    `QuantizedTensor` attributes and the `.to()` convenience API.
 
-2. **Accuracy Verification** — Compares quantization error across scale rules
-   (mse, abs_max, mae, static_6). Reports max/mean absolute and relative error,
-   plus improvement over standard NVFP4 (`static_6`).
+2. **Accuracy Verification** — Uses tllm_linear_lite's standard NVFP4 as an
+   independent baseline for cross-validation. Two parts:
+   - **Step 2a**: Quantize input and weight separately, report per-tensor and
+     averaged SQNR (dB) + mean abs error. Columns: `tllm` baseline +
+     fouroversix scale rules. SQNR gain measured against the tllm baseline.
+   - **Step 2b**: Run cuBLASLt FP4 GEMM, compare against BF16 reference GEMM.
+     Reports cosine similarity, mean/max abs error, and mean relative error.
+     Both tllm and fouroversix use the same cuBLASLt backend for a fair
+     comparison — only the quantization differs.
 
 3. **Performance Benchmark** — Measures quantization latency, effective memory
    bandwidth, and MBU% for each scale rule.
