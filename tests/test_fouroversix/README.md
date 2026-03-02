@@ -94,3 +94,44 @@ The example runs three stages:
 | `static_6` | Standard NVFP4: always max_e2m1=6 (same as TRT-LLM) |
 | `static_4` | Always max_e2m1=4 |
 
+## Reference Results (B200)
+
+Tested on NVIDIA B200, shape `[4096, 4096]`, BF16, fouroversix v1.0.0.
+
+### Quantization Error
+
+`tllm` = tllm_linear_lite standard NVFP4 (independent baseline). `static_6` should
+match `tllm` closely — both are standard NVFP4, different implementations.
+
+```
+                                tllm       mse    abs_max       mae  static_6
+Avg SQNR (dB)                 20.44     21.21✓     20.98     21.08     20.43
+Avg mean abs err            0.07145   0.06859    0.07188   0.06766✓  0.07145
+
+SQNR gain over tllm:
+  mse       +0.78 dB
+  abs_max   +0.54 dB
+  mae       +0.64 dB
+  static_6  -0.00 dB          ← validates fouroversix correctness
+```
+
+### End-to-End GEMM (cuBLASLt)
+
+```
+                                tllm       mse    abs_max       mae  static_6
+Cosine similarity            0.9910    0.9925✓    0.9920    0.9922    0.9910
+Mean abs error                6.858     6.275✓     6.444     6.373     6.858
+```
+
+All configs pass (cosine > 0.99). `mse` gives the best GEMM accuracy.
+
+### Quantize Latency
+
+```
+                                 mse    abs_max       mae  static_6
+Avg latency (us)              125.2      126.1     123.5      70.3
+```
+
+4/6 scale selection adds ~1.8x overhead vs standard NVFP4 (`static_6`).
+This is quantize-only latency; GEMM time dominates in practice.
+
