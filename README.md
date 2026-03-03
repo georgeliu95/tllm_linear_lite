@@ -25,8 +25,10 @@ Standalone modules for the NVFP4 GEMM pipeline, extracted from [TensorRT-LLM](ht
 |----------|--------|-------------|
 | `nvfp4_gemm(...)` | `tllm_linear_lite.nvfp4_gemm` | Unified dispatch: `cuda_core` if M<=16 and N%2==0 and K%16==0; else `cutedsl` (Blackwell SM100/103 + bf16 + K%32==0 + cutlass-dsl); else `cutlass` if K%32==0 and N%32==0; else `cublaslt` |
 | `fp4_quantize(...)` | `tllm_linear_lite.quantize` | Unified quantize wrapper (`backend="tllm"` or optional `backend="fouroversix"`) |
+| `calculate_nvfp4_global_scale(...)` | `tllm_linear_lite.quantize` | Per-token / global NVFP4 scale (Python wrapper over C++ op) |
 | `CuteDSLNVFP4Runner` | `tllm_linear_lite.cutedsl.runner` | Cute DSL JIT runner with SimpleTuner (SM100/103 only, bf16) |
 | `triton_amax(...)` | `tllm_linear_lite.amax` | Global absolute maximum with autotuning |
+| `triton_amax_partial(...)` | `tllm_linear_lite.amax` | Block-level partial amax (no final reduction) |
 
 ## Project Structure
 
@@ -38,15 +40,19 @@ tllm_linear_lite/
 ├── tllm_linear_lite/               # Python package
 │   ├── __init__.py                 # Loads .so, registers ops
 │   ├── nvfp4_gemm.py              # Unified GEMM dispatch (auto/cutedsl/cutlass/cublaslt/cuda_core)
+│   ├── quantize/                   # FP4 quantize Python API
+│   │   └── __init__.py             # fp4_quantize(), calculate_nvfp4_global_scale(), backend dispatch
 │   ├── cutedsl/                    # Cute DSL backend (Python-only, optional)
 │   │   ├── __init__.py             # IS_CUTLASS_DSL_AVAILABLE check
 │   │   ├── runner.py               # CuteDSLNVFP4Runner (simplified from TRT-LLM)
 │   │   ├── tuner.py                # SimpleTuner (minimal tactic profiler)
 │   │   └── kernels/                # Copied from TRT-LLM (no modifications)
+│   │       ├── __init__.py
 │   │       ├── dense_blockscaled_gemm_persistent.py  # Blackwell GEMM kernel (~2000 lines)
 │   │       ├── custom_pipeline.py  # PipelineTmaUmma, PipelineUmmaAsync
 │   │       └── utils.py            # make_ptr, griddepcontrol helpers
 │   └── amax/
+│       ├── __init__.py
 │       └── triton_amax.py          # Triton-based amax kernel (autotuned)
 ├── quantize/                       # FP4 quantization CUDA sources
 │   ├── tllm_compat.cuh             # Standalone compat header (replaces TRT-LLM common/)
@@ -58,6 +64,9 @@ tllm_linear_lite/
 │   ├── cutlass_fp4_gemm_op.cu      # CUTLASS backend PyTorch op wrapper
 │   └── cutlass_fp4/                # CUTLASS 3.x FP4 GEMM templates (SM100/103/120)
 │       ├── trtllm_cutlass_compat.h # Standalone compat for CUTLASS kernel headers
+│       ├── cutlass_type_conversion.h # Minimal dtype conversion (no NvInferRuntime.h)
+│       ├── archCondition.h         # SM architecture condition macros
+│       ├── gemm_configs.h          # GEMM tile/stage configuration definitions
 │       ├── fp4_gemm.h              # CutlassFp4GemmRunner interface
 │       ├── fp4_gemm_template.h     # GEMM dispatch logic (NVFP4 only, MXFP8 removed)
 │       ├── nvfp4_nvfp4_gemm_template_sm100.h  # SM100/SM103 kernel templates
@@ -66,7 +75,11 @@ tllm_linear_lite/
 │       └── fp4_gemm_bf16.cu        # Template instantiations (bf16, 51 kernels)
 └── tests/
     ├── test_quantize.py            # Quantize correctness + perf
-    └── test_nvfp4_gemm.py          # GEMM correctness (vs nn.Linear) + perf
+    ├── test_nvfp4_gemm.py          # GEMM correctness (vs nn.Linear) + perf
+    └── test_fouroversix/           # fouroversix integration example
+        ├── fouroversix_example.py  # Quantize + GEMM with fouroversix
+        ├── fouroversix.patch       # Patch for QuantizedTensor.to() method
+        └── README.md               # Setup instructions + reference results
 ```
 
 ## Requirements
@@ -105,15 +118,20 @@ pip install nvidia-cutlass-dsl>=4.3.4 cuda-core apache-tvm-ffi==0.1.6
 ```python
 import torch
 import tllm_linear_lite  # loads CUDA extension, registers ops
+from tllm_linear_lite.quantize import fp4_quantize
 
 x = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
 
-# Compute global scale
-global_scale = 448.0 * 6.0 / x.abs().amax().float()
+# High-level API (auto-computes global_scale if not provided)
+fp4_packed, scale_factors = fp4_quantize(x)
 
-# FP4 quantize (NVFP4: sfVecSize=16, sfUseUE8M0=False)
+# With fouroversix backend (optional dependency, adaptive block scaling)
+# qt = fp4_quantize(x, backend="fouroversix")  # returns QuantizedTensor
+
+# Low-level torch.ops API (explicit parameters)
+global_scale = 448.0 * 6.0 / x.abs().amax().float()
 fp4_packed, scale_factors = torch.ops.tllm_linear_lite.fp4_quantize(
-    x, global_scale, 16, False, True
+    x, global_scale, 16, False, True  # sfVecSize=16, sfUseUE8M0=False, swizzled=True
 )
 ```
 
@@ -162,6 +180,10 @@ python tests/test_nvfp4_gemm.py --backend auto --no-bias
 # Cross-validate with TensorRT-LLM (requires tensorrt_llm installed)
 python tests/test_quantize.py --compare-trtllm
 python tests/test_nvfp4_gemm.py --compare-trtllm  # placeholder, currently prints SKIP
+
+# fouroversix integration example (requires fouroversix, see tests/test_fouroversix/README.md)
+python tests/test_fouroversix/fouroversix_example.py
+python tests/test_fouroversix/fouroversix_example.py --shape 128,4096,4096 --scale-rules mse,static_6
 
 # Triton amax
 python tllm_linear_lite/amax/triton_amax.py
