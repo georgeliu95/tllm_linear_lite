@@ -31,7 +31,7 @@ import torch
 logger = logging.getLogger(__name__)
 _FOUROVERSIX_IMPORT_ERROR: Exception | None = None
 
-# Optional fouroversix: same NVFP4 semantics (e.g. static_6) for accuracy comparison.
+# Optional fouroversix: defaults to MSE-based four-over-six scale selection.
 try:
     import fouroversix
     from fouroversix import QuantizationConfig, quantize_to_fp4 as _fouroversix_quantize_to_fp4
@@ -95,10 +95,9 @@ def fp4_quantize(
                     f"Original error: {_FOUROVERSIX_IMPORT_ERROR}"
                 ) from _FOUROVERSIX_IMPORT_ERROR
             raise ImportError("fouroversix is not installed. Install it to use backend='fouroversix'.")
-        # Use static_6 (always 6) to align with standard NVFP4 / tllm semantics.
         config = kwargs.get("config")
         if config is None:
-            config = QuantizationConfig(scale_rule="static_6")
+            config = QuantizationConfig()
         return _fouroversix_quantize_to_fp4(x, config=config)
 
     raise ValueError(f"Unknown backend: {backend}. Use 'tllm' or 'fouroversix'.")

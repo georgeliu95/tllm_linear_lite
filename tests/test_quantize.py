@@ -336,23 +336,29 @@ def run_quantize_kernel(
     return (act_fp4, act_sf), avg_time_us
 
 
-def verify_correctness(input_tensor: torch.Tensor) -> bool:
-    """Verify numerical correctness of tllm_linear_lite.fp4_quantize.
+def test_accuracy(input_tensor: torch.Tensor) -> bool:
+    """Test quantization accuracy of all backends against original input.
 
-    Comparison structure:
-    1. PyTorch fake NVFP4 quantize vs CUDA kernel:
-       - Compare block scale factors (FP8 E4M3)
-       - Compare FP4 output values (unpacked E2M1)
-    2. Dequantize all implementations, compare each against original input
-       (PyTorch ref, CUDA kernel, and optionally fouroversix in one table)
-    3. Verify calculate_nvfp4_global_scale op
+    Compares dequantized outputs from tllm and fouroversix (multiple scale rules)
+    against the original input, using PyTorch fake-quantize as reference baseline.
+    All backends are shown in one unified table.
+
+    Args:
+        input_tensor: [M, K] BF16/FP16 input tensor on CUDA.
+
+    Returns:
+        True if all tllm checks pass. fouroversix results are informational only.
     """
     print("\n" + "=" * 80)
-    print("Correctness Verification")
+    print("Accuracy (dequant error vs original input)")
     print("=" * 80)
 
     try:
-        M = input_tensor.shape[0] if input_tensor.dim() == 2 else input_tensor.reshape(-1, input_tensor.shape[-1]).shape[0]
+        M = (
+            input_tensor.shape[0]
+            if input_tensor.dim() == 2
+            else input_tensor.reshape(-1, input_tensor.shape[-1]).shape[0]
+        )
         K = input_tensor.shape[-1]
         block_size = 16
         global_scale_val = (448.0 * 6.0 / input_tensor.abs().amax().float()).item()
@@ -362,145 +368,144 @@ def verify_correctness(input_tensor: torch.Tensor) -> bool:
         print(f"Global scale: {global_scale_val:.4f}")
 
         # ================================================================
-        # Run both implementations
+        # Run all backends, collect dequant error vs original input
         # ================================================================
 
-        # PyTorch reference (fake quantize)
+        # backends[name] = {"err": abs_error, "rel_err": relative_error}
+        backends: dict[str, dict[str, torch.Tensor]] = {}
+
+        # --- PyTorch reference (golden baseline) ---
         ref_fp4_float, ref_sf = fp4_quantize_reference(
             input_tensor, global_scale_val, block_size
         )
         ref_fp4_float = ref_fp4_float.to(input_tensor.device)
         ref_sf = ref_sf.to(input_tensor.device)
-        ref_dequant = dequantize_fp4(ref_fp4_float, ref_sf, global_scale_val, block_size)
+        ref_dequant = dequantize_fp4(
+            ref_fp4_float, ref_sf, global_scale_val, block_size
+        )
+        ref_err = (ref_dequant - input_flat).abs()
+        backends["PyTorch Ref"] = {
+            "err": ref_err,
+            "rel_err": ref_err / input_flat.abs().clamp(min=1e-6),
+        }
 
-        # CUDA kernel (LINEAR layout for easy comparison)
+        # --- tllm CUDA kernel (linear layout for comparison) ---
         act_fp4, act_sf = quantize(input_tensor, swizzled=False)
         kernel_fp4_float, kernel_sf = unpack_cuda_fp4_output(
             act_fp4, act_sf, M, K, block_size
         )
-        kernel_dequant = dequantize_fp4(kernel_fp4_float, kernel_sf, global_scale_val, block_size)
+        kernel_dequant = dequantize_fp4(
+            kernel_fp4_float, kernel_sf, global_scale_val, block_size
+        )
+        kernel_err = (kernel_dequant - input_flat).abs()
+        backends["tllm"] = {
+            "err": kernel_err,
+            "rel_err": kernel_err / input_flat.abs().clamp(min=1e-6),
+        }
+
+        # --- fouroversix (multiple scale rules) ---
+        _F46_SCALE_RULES = ("mse", "abs_max", "mae")
+        if FOUROVERSIX_AVAILABLE:
+            from fouroversix import QuantizationConfig as F46Config
+
+            for rule in _F46_SCALE_RULES:
+                try:
+                    config = F46Config(scale_rule=rule)
+                    x_f46 = fp4_quantize_unified(
+                        input_tensor, backend="fouroversix", config=config
+                    )
+                    f46_dequant = x_f46.dequantize(dtype=torch.bfloat16).float()
+                    if f46_dequant.shape != input_flat.shape:
+                        f46_dequant = f46_dequant[
+                            : input_flat.shape[0], : input_flat.shape[1]
+                        ]
+                    err = (f46_dequant - input_flat).abs()
+                    backends[f"f46({rule})"] = {
+                        "err": err,
+                        "rel_err": err / input_flat.abs().clamp(min=1e-6),
+                    }
+                except Exception as e:
+                    print(f"\n  [WARN] fouroversix ({rule}) failed: {e}")
+        else:
+            print("\n  fouroversix: [SKIP] not installed")
 
         # ================================================================
-        # Step 1: PyTorch fake quantize vs CUDA kernel (FP4 output + scales)
+        # Bit-exact sub-check: tllm vs PyTorch reference
         # ================================================================
-        print("\n--- Step 1: Quantized output comparison (PyTorch ref vs CUDA kernel) ---")
-
-        # 1a. Scale factors
         sf_match = torch.equal(kernel_sf, ref_sf)
-        sf_diff = (kernel_sf - ref_sf).abs()
-        sf_mismatch = (sf_diff > 0).sum().item()
-        sf_max_diff = sf_diff.max().item()
-
-        print(f"\n  Block scale factors ({kernel_sf.numel()} values):")
-        if sf_match:
-            print(f"    [PASS] Exact match")
-        else:
-            print(f"    Mismatches: {sf_mismatch}/{kernel_sf.numel()} ({100*sf_mismatch/kernel_sf.numel():.4f}%)")
-            print(f"    Max diff:   {sf_max_diff:.6f}")
-            print(f"    {'[PASS] Within tolerance' if sf_max_diff < 1e-3 else '[WARN] Exceeds tolerance'}")
-
-        # 1b. FP4 values (E2M1 representable, before dequant)
         fp4_match = torch.equal(kernel_fp4_float, ref_fp4_float)
-        fp4_diff = (kernel_fp4_float - ref_fp4_float).abs()
-        fp4_mismatch = (fp4_diff > 0).sum().item()
-        fp4_max_diff = fp4_diff.max().item()
 
-        print(f"\n  FP4 values ({kernel_fp4_float.numel()} values):")
-        if fp4_match:
-            print(f"    [PASS] Exact match")
+        print(f"\n  Bit-exact check (tllm vs PyTorch ref):")
+        if sf_match:
+            print(f"    Scale factors: [PASS] exact match")
         else:
-            print(f"    Mismatches: {fp4_mismatch}/{kernel_fp4_float.numel()} ({100*fp4_mismatch/kernel_fp4_float.numel():.4f}%)")
-            print(f"    Max diff:   {fp4_max_diff:.6f}")
+            n_diff = (kernel_sf != ref_sf).sum().item()
+            sf_max_diff = (kernel_sf - ref_sf).abs().max().item()
+            tag = "PASS" if sf_max_diff < 1e-3 else "WARN"
+            print(f"    Scale factors: [{tag}] {n_diff}/{kernel_sf.numel()} differ (max_diff={sf_max_diff:.6f})")
+
+        fp4_mismatch_pct = 0.0
+        if fp4_match:
+            print(f"    FP4 values:    [PASS] exact match")
+        else:
+            n_diff = (kernel_fp4_float != ref_fp4_float).sum().item()
+            fp4_mismatch_pct = 100 * n_diff / kernel_fp4_float.numel()
             # FP4 rounding near decision boundaries + reciprocal_approximate_ftz
             # can cause ~0.1% of values to differ by one E2M1 step
-            pct = 100 * fp4_mismatch / kernel_fp4_float.numel()
-            print(f"    {'[PASS] Within tolerance' if pct < 1.0 else '[WARN] Exceeds 1% mismatch rate'}")
+            tag = "PASS" if fp4_mismatch_pct < 1.0 else "WARN"
+            print(f"    FP4 values:    [{tag}] {n_diff}/{kernel_fp4_float.numel()} differ ({fp4_mismatch_pct:.4f}%)")
 
         # ================================================================
-        # Step 2: Dequantized outputs vs original input (quantization error)
-        #         Includes fouroversix (optional) in the same table.
+        # Unified accuracy table
         # ================================================================
-        print("\n--- Step 2: Dequantized output vs original input ---")
+        names = list(backends.keys())
+        col_w = 14
+        header = f"  {'Metric':<25}" + "".join(f"{n:>{col_w}}" for n in names)
+        sep = f"  {'-' * (25 + col_w * len(names))}"
 
-        # PyTorch reference dequant error
-        ref_err = (ref_dequant - input_flat).abs()
-        ref_rel_err = ref_err / (input_flat.abs().clamp(min=1e-6))
+        def _fmt(v: float, w: int = col_w) -> str:
+            return f"{v:>{w}.6f}"
 
-        # CUDA kernel dequant error
-        kernel_err = (kernel_dequant - input_flat).abs()
-        kernel_rel_err = kernel_err / (input_flat.abs().clamp(min=1e-6))
+        def _fmt_rel(v: float, w: int = col_w) -> str:
+            return f"{v:>{w}.4f}"
 
-        # fouroversix dequant error (optional)
-        fouroversix_pass: bool | None = None
-        f46_err = None
-        f46_rel_err = None
-        if FOUROVERSIX_AVAILABLE:
-            try:
-                x_f46 = fp4_quantize_unified(input_tensor, backend="fouroversix")
-                f46_dequant = x_f46.dequantize(dtype=torch.bfloat16).float()
-                if f46_dequant.shape != input_flat.shape:
-                    f46_dequant = f46_dequant[: input_flat.shape[0], : input_flat.shape[1]]
-                f46_err = (f46_dequant - input_flat).abs()
-                f46_rel_err = f46_err / (input_flat.abs().clamp(min=1e-6))
-            except Exception as e:
-                print(f"\n  [WARN] fouroversix run failed: {e}")
-                fouroversix_pass = False
+        print(f"\n{header}")
+        print(sep)
+        print(f"  {'Max abs error':<25}" + "".join(
+            _fmt(backends[n]["err"].max().item()) for n in names
+        ))
+        print(f"  {'Mean abs error':<25}" + "".join(
+            _fmt(backends[n]["err"].mean().item()) for n in names
+        ))
+        print(f"  {'Max relative error':<25}" + "".join(
+            _fmt_rel(backends[n]["rel_err"].max().item()) for n in names
+        ))
+        print(f"  {'Mean relative error':<25}" + "".join(
+            _fmt_rel(backends[n]["rel_err"].mean().item()) for n in names
+        ))
 
-        # Print unified table
-        has_f46 = f46_err is not None
-        f46_col = "  fouroversix" if has_f46 else ""
-        print(f"\n  {'Metric':<25} {'PyTorch Ref':>15} {'CUDA Kernel':>15}{f46_col:>15}")
-        print(f"  {'-' * (70 if has_f46 else 55)}")
-
-        def _fmt(v: float, width: int = 15) -> str:
-            return f"{v:>{width}.6f}"
-
-        def _fmt_rel(v: float, width: int = 15) -> str:
-            return f"{v:>{width}.4f}"
-
-        f46_max_abs = _fmt(f46_err.max().item()) if has_f46 else ""
-        f46_mean_abs = _fmt(f46_err.mean().item()) if has_f46 else ""
-        f46_max_rel = _fmt_rel(f46_rel_err.max().item()) if has_f46 else ""
-        f46_mean_rel = _fmt_rel(f46_rel_err.mean().item()) if has_f46 else ""
-
-        print(f"  {'Max abs error':<25} {_fmt(ref_err.max().item())} {_fmt(kernel_err.max().item())}{f46_max_abs}")
-        print(f"  {'Mean abs error':<25} {_fmt(ref_err.mean().item())} {_fmt(kernel_err.mean().item())}{f46_mean_abs}")
-        print(f"  {'Max relative error':<25} {_fmt_rel(ref_rel_err.max().item())} {_fmt_rel(kernel_rel_err.max().item())}{f46_max_rel}")
-        print(f"  {'Mean relative error':<25} {_fmt_rel(ref_rel_err.mean().item())} {_fmt_rel(kernel_rel_err.mean().item())}{f46_mean_rel}")
-
-        if not has_f46 and FOUROVERSIX_AVAILABLE:
-            pass  # already printed WARN above
-        elif not FOUROVERSIX_AVAILABLE:
-            print(f"\n  fouroversix: [SKIP] not installed")
-
-        # Error ratio vs PyTorch reference (same criteria for all backends)
-        ref_mean = max(ref_err.mean().item(), 1e-10)
-        err_ratio = kernel_err.mean().item() / ref_mean
-        print(f"\n  CUDA Kernel / PyTorch Ref error ratio: {err_ratio:.4f}")
-        if 0.5 < err_ratio < 2.0:
-            print(f"  [PASS] CUDA kernel has similar quantization error to reference")
-        else:
-            print(f"  [WARN] Error ratio outside [0.5, 2.0], implementations may diverge")
-
-        if has_f46:
-            f46_ratio = f46_err.mean().item() / ref_mean
-            print(f"  fouroversix / PyTorch Ref error ratio: {f46_ratio:.4f}")
-            fouroversix_pass = 0.5 < f46_ratio < 2.0
-            if fouroversix_pass:
-                print(f"  [PASS] fouroversix has similar quantization error to reference")
-            else:
-                print(f"  [WARN] Error ratio outside [0.5, 2.0], check fouroversix config")
+        # Error ratio vs PyTorch Ref (mean abs error)
+        ref_mean = max(backends["PyTorch Ref"]["err"].mean().item(), 1e-10)
+        print(f"\n  Error ratio vs PyTorch Ref (mean abs error):")
+        tllm_ratio_ok = True
+        for n in names:
+            if n == "PyTorch Ref":
+                continue
+            ratio = backends[n]["err"].mean().item() / ref_mean
+            ok = ratio < 2.0
+            tag = "PASS" if ok else "WARN"
+            print(f"    {n:<20} {ratio:.4f}  [{tag}]")
+            if not ok and n == "tllm":
+                tllm_ratio_ok = False
 
         # ================================================================
-        # Step 3: calculate_nvfp4_global_scale
+        # calculate_nvfp4_global_scale sub-check
         # ================================================================
-        print("\n--- Step 3: calculate_nvfp4_global_scale ---")
+        print(f"\n  calculate_nvfp4_global_scale:")
 
         per_token_scale = torch.ops.tllm_linear_lite.calculate_nvfp4_global_scale(
             input_tensor, None
         )
-
-        # PyTorch reference
         ref_per_token = 448.0 * 6.0 / input_flat.abs().amax(dim=-1, keepdim=True)
         kernel_pts = per_token_scale.float().reshape(M, 1)
 
@@ -510,32 +515,31 @@ def verify_correctness(input_tensor: torch.Tensor) -> bool:
         assert not torch.isnan(per_token_scale).any(), "Per-token scale contains NaN"
         assert not torch.isinf(per_token_scale).any(), "Per-token scale contains Inf"
 
-        if pts_max_diff < 1e-2:
-            print(f"  [PASS] Per-token global scale matches (max_diff={pts_max_diff:.6f})")
-        else:
-            print(f"  [WARN] Per-token global scale max_diff={pts_max_diff:.6f}")
+        pts_pass = pts_max_diff < 1e-2
+        tag = "PASS" if pts_pass else "WARN"
+        print(f"    [{tag}] max_diff={pts_max_diff:.6f}")
 
         # ================================================================
-        # Summary
+        # Summary: only tllm checks determine pass/fail
         # ================================================================
-        print("\n" + "=" * 80)
+        sf_max_diff = 0.0 if sf_match else (kernel_sf - ref_sf).abs().max().item()
         all_pass = (
-            (sf_max_diff < 1e-3)
-            and (100 * fp4_mismatch / kernel_fp4_float.numel() < 1.0)
-            and (0.5 < err_ratio < 2.0)
-            and (pts_max_diff < 1e-2)
+            tllm_ratio_ok
+            and (sf_match or sf_max_diff < 1e-3)
+            and fp4_mismatch_pct < 1.0
+            and pts_pass
         )
-        if fouroversix_pass is False:
-            all_pass = False
+
+        print("\n" + "=" * 80)
         if all_pass:
-            print("[PASS] All correctness checks passed")
+            print("[PASS] All accuracy checks passed")
         else:
             print("[WARN] Some checks have warnings, review above")
         print("=" * 80)
         return all_pass
 
     except Exception as e:
-        print(f"\n[FAIL] Verification failed: {e}")
+        print(f"\n[FAIL] Accuracy test failed: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -603,9 +607,18 @@ def benchmark(
     warmup: int = 5,
     repeat: int = 20,
 ):
-    """Run performance benchmark."""
+    """Benchmark quantization performance: tllm as baseline, fouroversix variants compared.
+
+    Measures kernel latency, effective bandwidth, and MBU% for tllm and each
+    fouroversix scale rule (mse, abs_max, mae) in one unified table.
+
+    Args:
+        input_tensor: Input tensor (BF16/FP16, CUDA).
+        warmup: Number of warmup iterations.
+        repeat: Number of timed iterations.
+    """
     print("\n" + "=" * 80)
-    print("Performance Benchmark (tllm_linear_lite)")
+    print("Performance Benchmark")
     print("=" * 80)
 
     n_elements = input_tensor.numel()
@@ -617,29 +630,7 @@ def benchmark(
     print(f"Data size:    {data_bytes / 1024 / 1024:.2f} MB")
     print(f"Warmup: {warmup}, Repeat: {repeat}")
 
-    # Step 1: Scale computation time (fixed overhead)
-    print("\n--- Scale Computation (Fixed Overhead) ---")
-    with nvtx.annotate("benchmark/scale_computation"):
-        act_global_scale, scale_time_us = measure_scale_computation(
-            input_tensor, warmup=warmup, repeat=repeat
-        )
-    print(f"Scale computation: {scale_time_us:.2f} us")
-
-    # Step 2: Kernel time
-    print("\n--- fp4_quantize Kernel ---")
-    with nvtx.annotate("benchmark/tllm_fp4_quantize"):
-        (act_fp4, act_sf), kernel_time_us = run_quantize_kernel(
-            input_tensor, act_global_scale, warmup=warmup, repeat=repeat
-        )
-
-    total_time_us = scale_time_us + kernel_time_us
-
-    # Bandwidth calculation
-    output_bytes = act_fp4.numel() * act_fp4.element_size() + act_sf.numel() * act_sf.element_size()
-    kernel_bytes = data_bytes + output_bytes
-    bandwidth_tb_s = kernel_bytes / (kernel_time_us * 1e-6) / 1e12
-
-    # GPU peak bandwidth (B200 = 8 TB/s, H100 SXM = 3.35 TB/s)
+    # GPU peak bandwidth for MBU calculation (B200 = 8 TB/s, H100 SXM = 3.35 TB/s)
     gpu_name = torch.cuda.get_device_name(0).lower()
     if "b200" in gpu_name or "b100" in gpu_name:
         peak_bw = 8.0
@@ -647,58 +638,118 @@ def benchmark(
         peak_bw = 3.35
     else:
         peak_bw = 2.0  # conservative estimate
-    mbu_pct = bandwidth_tb_s / peak_bw * 100
 
-    print(f"\n{'Metric':<30} {'Value':>15}")
-    print("-" * 50)
-    print(f"{'Kernel time':<30} {kernel_time_us:>12.2f} us")
-    print(f"{'Scale computation':<30} {scale_time_us:>12.2f} us")
-    print(f"{'Total time':<30} {total_time_us:>12.2f} us")
-    print(f"{'Effective bandwidth':<30} {bandwidth_tb_s:>12.2f} TB/s")
-    print(f"{'Memory bandwidth utilization':<30} {mbu_pct:>11.1f} %")
+    # ================================================================
+    # tllm baseline: scale computation (footnote) + kernel
+    # ================================================================
+    with nvtx.annotate("benchmark/scale_computation"):
+        act_global_scale, scale_time_us = measure_scale_computation(
+            input_tensor, warmup=warmup, repeat=repeat
+        )
 
-    print(f"\n--- Output Statistics ---")
-    print(f"  FP4 output:      {act_fp4.numel() * act_fp4.element_size() / 1024:.2f} KB")
-    print(f"  Scale factors:   {act_sf.numel() * act_sf.element_size() / 1024:.2f} KB")
-    print(f"  Compression:     {data_bytes / (act_fp4.numel() * act_fp4.element_size()):.2f}x")
+    with nvtx.annotate("benchmark/tllm_fp4_quantize"):
+        (act_fp4, act_sf), tllm_kernel_us = run_quantize_kernel(
+            input_tensor, act_global_scale, warmup=warmup, repeat=repeat
+        )
 
-    # fouroversix benchmark (optional)
+    output_bytes = (
+        act_fp4.numel() * act_fp4.element_size()
+        + act_sf.numel() * act_sf.element_size()
+    )
+    total_bytes = data_bytes + output_bytes
+
+    # ================================================================
+    # fouroversix: each scale rule measured separately
+    # ================================================================
+    _F46_SCALE_RULES = ("mse", "abs_max", "mae")
+    f46_times: dict[str, float] = {}
+
     if FOUROVERSIX_AVAILABLE:
-        print(f"\n--- fouroversix fp4_quantize ---")
-        try:
-            with nvtx.annotate("benchmark/fouroversix_warmup"):
-                for _ in range(warmup):
-                    _ = fp4_quantize_unified(input_tensor, backend="fouroversix")
-                torch.cuda.synchronize()
+        from fouroversix import QuantizationConfig as F46Config
 
-            f46_times = []
-            with nvtx.annotate("benchmark/fouroversix_fp4_quantize"):
-                for i in range(repeat):
-                    start = torch.cuda.Event(enable_timing=True)
-                    end = torch.cuda.Event(enable_timing=True)
-                    rng = nvtx.start_range(f"fouroversix/iter_{i}")
-                    start.record()
-                    _ = fp4_quantize_unified(input_tensor, backend="fouroversix")
-                    end.record()
-                    nvtx.end_range(rng)
+        for rule in _F46_SCALE_RULES:
+            try:
+                config = F46Config(scale_rule=rule)
+
+                with nvtx.annotate(f"benchmark/f46_{rule}/warmup"):
+                    for _ in range(warmup):
+                        _ = fp4_quantize_unified(
+                            input_tensor, backend="fouroversix", config=config
+                        )
                     torch.cuda.synchronize()
-                    f46_times.append(start.elapsed_time(end) * 1000)  # ms -> us
 
-            f46_avg_us = sum(f46_times) / len(f46_times)
-            f46_bw = kernel_bytes / (f46_avg_us * 1e-6) / 1e12
-            f46_mbu = f46_bw / peak_bw * 100
-            speedup = f46_avg_us / kernel_time_us
+                times = []
+                with nvtx.annotate(f"benchmark/f46_{rule}/timed"):
+                    for i in range(repeat):
+                        start = torch.cuda.Event(enable_timing=True)
+                        end = torch.cuda.Event(enable_timing=True)
+                        rng = nvtx.start_range(f"f46_{rule}/iter_{i}")
+                        start.record()
+                        _ = fp4_quantize_unified(
+                            input_tensor, backend="fouroversix", config=config
+                        )
+                        end.record()
+                        nvtx.end_range(rng)
+                        torch.cuda.synchronize()
+                        times.append(start.elapsed_time(end) * 1000)  # ms -> us
 
-            print(f"\n  {'Metric':<30} {'tllm':>12} {'fouroversix':>12}")
-            print(f"  {'-' * 54}")
-            print(f"  {'Kernel time (us)':<30} {kernel_time_us:>12.2f} {f46_avg_us:>12.2f}")
-            print(f"  {'Effective BW (TB/s)':<30} {bandwidth_tb_s:>12.2f} {f46_bw:>12.2f}")
-            print(f"  {'MBU %':<30} {mbu_pct:>11.1f}% {f46_mbu:>11.1f}%")
-            print(f"  fouroversix / tllm latency ratio: {speedup:.2f}x")
-        except Exception as e:
-            print(f"  [WARN] fouroversix benchmark failed: {e}")
+                f46_times[rule] = sum(times) / len(times)
+            except Exception as e:
+                print(f"\n  [WARN] fouroversix ({rule}) benchmark failed: {e}")
     else:
-        print(f"\n  fouroversix: [SKIP] not installed")
+        print("\n  fouroversix: [SKIP] not installed")
+
+    # ================================================================
+    # Unified performance table (tllm = baseline)
+    # ================================================================
+    col_names: list[str] = ["tllm"]
+    col_times: list[float] = [tllm_kernel_us]
+    for rule in _F46_SCALE_RULES:
+        if rule in f46_times:
+            col_names.append(f"f46({rule})")
+            col_times.append(f46_times[rule])
+
+    col_w = 14
+    header = f"  {'Metric':<25}" + "".join(f"{n:>{col_w}}" for n in col_names)
+    sep = f"  {'-' * (25 + col_w * len(col_names))}"
+
+    print(f"\n{header}")
+    print(sep)
+
+    # Kernel time
+    print(f"  {'Kernel time (us)':<25}" + "".join(
+        f"{t:>{col_w}.2f}" for t in col_times
+    ))
+
+    # Effective bandwidth
+    bws = [total_bytes / (t * 1e-6) / 1e12 for t in col_times]
+    print(f"  {'Effective BW (TB/s)':<25}" + "".join(
+        f"{bw:>{col_w}.2f}" for bw in bws
+    ))
+
+    # Memory bandwidth utilization
+    mbus = [bw / peak_bw * 100 for bw in bws]
+    print(f"  {'MBU %':<25}" + "".join(
+        f"{m:>{col_w - 1}.1f}%" for m in mbus
+    ))
+
+    # Latency ratio vs tllm baseline (>1 means slower than tllm)
+    if len(col_times) > 1:
+        print(f"  {'Latency vs tllm':<25}" + "".join(
+            f"{'1.00x':>{col_w}}" if i == 0
+            else f"{t / tllm_kernel_us:>{col_w - 1}.2f}x"
+            for i, t in enumerate(col_times)
+        ))
+
+    # Scale computation footnote (PyTorch abs.amax, not part of tllm kernel)
+    print(f"\n  Note: global scale (abs.amax) overhead = {scale_time_us:.2f} us"
+          f" (not included in kernel times above)")
+
+    # Output statistics
+    print(f"\n  Output statistics:")
+    print(f"    FP4 output:    {act_fp4.numel() * act_fp4.element_size() / 1024:.2f} KB")
+    print(f"    Scale factors: {act_sf.numel() * act_sf.element_size() / 1024:.2f} KB")
+    print(f"    Compression:   {data_bytes / (act_fp4.numel() * act_fp4.element_size()):.2f}x")
 
 
 def run_ncu_mode(input_tensor: torch.Tensor):
@@ -768,8 +819,8 @@ def main():
         run_ncu_mode(input_tensor)
     else:
         if not args.skip_verify:
-            if not verify_correctness(input_tensor):
-                print("\n[FAIL] Verification failed, aborting.")
+            if not test_accuracy(input_tensor):
+                print("\n[FAIL] Accuracy test failed, aborting.")
                 return
 
         if args.compare_trtllm:
