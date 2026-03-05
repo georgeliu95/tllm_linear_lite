@@ -29,6 +29,7 @@ Standalone modules for the NVFP4 GEMM pipeline, extracted from [TensorRT-LLM](ht
 | `CuteDSLNVFP4Runner` | `tllm_linear_lite.cutedsl.runner` | Cute DSL JIT runner with SimpleTuner (SM100/103 only, bf16) |
 | `triton_amax(...)` | `tllm_linear_lite.amax` | Global absolute maximum with autotuning |
 | `triton_amax_partial(...)` | `tllm_linear_lite.amax` | Block-level partial amax (no final reduction) |
+| `NVFP4DynamicLinear` | `tllm_linear_lite.nvfp4_linear` | End-to-end W4A4 dynamic-quantized `nn.Linear` replacement (tllm or fouroversix quant, auto GEMM dispatch) |
 
 ## Project Structure
 
@@ -40,6 +41,7 @@ tllm_linear_lite/
 ├── tllm_linear_lite/               # Python package
 │   ├── __init__.py                 # Loads .so, registers ops
 │   ├── nvfp4_gemm.py              # Unified GEMM dispatch (auto/cutedsl/cutlass/cublaslt/cuda_core)
+│   ├── nvfp4_linear.py            # NVFP4DynamicLinear nn.Module (fused quantize + GEMM)
 │   ├── quantize/                   # FP4 quantize Python API
 │   │   └── __init__.py             # fp4_quantize(), calculate_nvfp4_global_scale(), backend dispatch
 │   ├── cutedsl/                    # Cute DSL backend (Python-only, optional)
@@ -76,6 +78,7 @@ tllm_linear_lite/
 └── tests/
     ├── test_quantize.py            # Quantize correctness + perf
     ├── test_nvfp4_gemm.py          # GEMM correctness (vs nn.Linear) + perf
+    ├── test_nvfp4_linear.py        # NVFP4DynamicLinear end-to-end correctness
     └── test_fouroversix/           # fouroversix integration example
         ├── fouroversix_example.py  # Quantize + GEMM with fouroversix
         ├── fouroversix.patch       # Patch for QuantizedTensor.to() method
@@ -153,6 +156,37 @@ output = nvfp4_gemm(
 )
 ```
 
+### NVFP4DynamicLinear (nn.Module)
+
+```python
+import torch
+import torch.nn as nn
+from tllm_linear_lite.nvfp4_linear import NVFP4DynamicLinear
+
+# Convert a pretrained nn.Linear to NVFP4 (weights quantized, activations dynamic)
+linear = nn.Linear(4096, 4096, bias=True, device="cuda", dtype=torch.bfloat16)
+nvfp4 = NVFP4DynamicLinear.from_linear(linear)
+
+# Supports N-D input just like nn.Linear
+x = torch.randn(2, 128, 4096, device="cuda", dtype=torch.bfloat16)
+output = nvfp4(x)  # [2, 128, 4096]
+
+# With fouroversix quantization backend (optional dependency)
+# from fouroversix import QuantizationConfig
+# nvfp4_fox = NVFP4DynamicLinear.from_linear(
+#     linear, quant_backend="fouroversix",
+#     quant_config=QuantizationConfig(scale_rule="mse"),
+# )
+
+# Explicit GEMM backend selection
+nvfp4_cublaslt = NVFP4DynamicLinear.from_linear(linear, gemm_backend="cublaslt")
+```
+
+> **Known limitations**:
+> - K must be a multiple of 32 for cutlass/cutedsl backends (auto-fallback to cublaslt otherwise)
+> - Only SWIZZLED scale factor layout (cuda_core backend not used by the module)
+> - Bias epilogue fusion only on cublaslt backend; other backends use post-GEMM addition
+
 ### Triton Amax
 
 ```python
@@ -176,6 +210,12 @@ python tests/test_nvfp4_gemm.py --backend cutlass
 python tests/test_nvfp4_gemm.py --backend cutedsl  # requires nvidia-cutlass-dsl
 python tests/test_nvfp4_gemm.py --backend cublaslt
 python tests/test_nvfp4_gemm.py --backend auto --no-bias
+
+# NVFP4DynamicLinear: end-to-end correctness (vs nn.Linear)
+python tests/test_nvfp4_linear.py
+python tests/test_nvfp4_linear.py --gemm-backend cublaslt
+python tests/test_nvfp4_linear.py --quant-backend all   # includes fouroversix (if installed)
+python tests/test_nvfp4_linear.py --no-bias
 
 # Cross-validate with TensorRT-LLM (requires tensorrt_llm installed)
 python tests/test_quantize.py --compare-trtllm
@@ -230,7 +270,7 @@ See comment blocks at top of each file for detailed diff from TRT-LLM originals.
 - [x] Optional fouroversix wrapper -- `tllm_linear_lite.quantize.fp4_quantize(..., backend="fouroversix")`
 - [ ] Bias epilogue fusion for non-cuBLASLt backends (cutlass/cuda_core/cutedsl)
 - [ ] FourOverSix adaptive block scaling in native CUDA quantize path
-- [ ] End-to-end NVFP4 Linear -- Fused quantize + GEMM `nn.Module`
+- [x] End-to-end NVFP4 Linear -- `NVFP4DynamicLinear` fused quantize + GEMM `nn.Module` (tllm + fouroversix quant backends)
 
 ## License
 

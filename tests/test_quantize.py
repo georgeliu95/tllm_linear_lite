@@ -755,29 +755,49 @@ def benchmark(
 def run_ncu_mode(input_tensor: torch.Tensor):
     """NCU profiling mode: single iteration for each op."""
     print("\n" + "=" * 80)
-    print("NCU Profiling Mode (tllm_linear_lite)")
+    print("NCU Profiling Mode (tllm_linear_lite + fouroversix)")
     print("=" * 80)
 
-    # Warmup
+    # Warmup: run all variants to avoid cold-start effects
     print("Warmup...")
     for _ in range(3):
         _ = quantize(input_tensor)
+    if FOUROVERSIX_AVAILABLE:
+        from fouroversix import QuantizationConfig as F46Config
+        for rule in ("mse", "abs_max", "mae"):
+            for _ in range(3):
+                _ = fp4_quantize_unified(
+                    input_tensor, backend="fouroversix", config=F46Config(scale_rule=rule)
+                )
     torch.cuda.synchronize()
     print("Warmup complete.\n")
 
-    torch.cuda.cudart().cudaProfilerStart()
+    # "ncu_capture" marks the exact region NCU should capture via --nvtx-include.
+    # Warmup above is intentionally outside this range.
+    with nvtx.annotate("ncu_capture"):
+        # ------------------------------------------------------------------ tllm
+        print("Profiling fp4_quantize (tllm_linear_lite)...")
+        with nvtx.annotate("tllm_linear_lite/fp4_quantize"):
+            act_fp4, act_sf = quantize(input_tensor)
+            torch.cuda.synchronize()
 
-    print("Profiling fp4_quantize...")
-    with nvtx.annotate("tllm_linear_lite_fp4_quantize"):
-        act_fp4, act_sf = quantize(input_tensor)
-        torch.cuda.synchronize()
+        print("Profiling calculate_nvfp4_global_scale (tllm_linear_lite)...")
+        with nvtx.annotate("tllm_linear_lite/global_scale"):
+            _ = torch.ops.tllm_linear_lite.calculate_nvfp4_global_scale(input_tensor, None)
+            torch.cuda.synchronize()
 
-    print("Profiling calculate_nvfp4_global_scale...")
-    with nvtx.annotate("tllm_linear_lite_global_scale"):
-        _ = torch.ops.tllm_linear_lite.calculate_nvfp4_global_scale(input_tensor, None)
-        torch.cuda.synchronize()
-
-    torch.cuda.cudart().cudaProfilerStop()
+        # ------------------------------------------------------------------ fouroversix
+        if FOUROVERSIX_AVAILABLE:
+            from fouroversix import QuantizationConfig as F46Config
+            for rule in ("mse", "abs_max", "mae"):
+                print(f"Profiling fouroversix fp4_quantize (scale_rule={rule})...")
+                with nvtx.annotate(f"fouroversix/fp4_quantize/{rule}"):
+                    _ = fp4_quantize_unified(
+                        input_tensor, backend="fouroversix", config=F46Config(scale_rule=rule)
+                    )
+                    torch.cuda.synchronize()
+        else:
+            print("fouroversix: [SKIP] not installed")
 
     print(f"\nFP4 output shape:   {act_fp4.shape}")
     print(f"Scale factor shape: {act_sf.shape}")
