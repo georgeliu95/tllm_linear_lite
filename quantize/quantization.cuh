@@ -679,8 +679,246 @@ namespace kernels
  #endif
  }
  
- __global__ void block_scale_interleave_kernel(
-     int numbatches, int numRows, int numCols, uint8_t const* SFIn, uint8_t* SFOutput);
- } // namespace kernels
- 
- TRTLLM_NAMESPACE_END
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// v1 Optimization: 16 elements per thread, 256-bit vectorized load, increased ILP
+
+// v1 processes 16 elements per thread (vs 8 in v0).
+constexpr int CVT_OPT_ELTS_PER_THREAD = 16;
+
+/*
+ * PackedVec_Opt: 32-byte aligned vector holding 16 FP16/BF16 elements (8 vec2 values).
+ * Used exclusively by opt_quantize_with_block_size_v1.
+ */
+template <class Type>
+struct __align__(32) PackedVec_Opt
+{
+    typename TypeConverter<Type>::Type elts[8];
+    static_assert(sizeof(elts) == sizeof(Type) * CVT_OPT_ELTS_PER_THREAD,
+        "Vector size should match the number of elements per thread.");
+};
+
+/*
+ * Load 32 bytes (256 bits) from global memory using two consecutive 128-bit loads.
+ * The two-instruction sequence guarantees LDG.E.128 in SASS, which is optimal for
+ * 32-byte aligned global loads. A single 256-bit PTX load is not available on sm_100.
+ */
+template <class T>
+__device__ __forceinline__ void load_256bit(T* dst, void const* src)
+{
+    static_assert(sizeof(T) == 32, "load_256bit requires T to be exactly 32 bytes");
+    uint32_t* dst_u32 = reinterpret_cast<uint32_t*>(dst);
+    char const* src_char = reinterpret_cast<char const*>(src);
+
+    // First 128-bit load (bytes 0-15)
+    asm volatile(
+        "ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+        : "=r"(dst_u32[0]), "=r"(dst_u32[1]), "=r"(dst_u32[2]), "=r"(dst_u32[3])
+        : "l"(src_char)
+    );
+
+    // Second 128-bit load (bytes 16-31)
+    asm volatile(
+        "ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+        : "=r"(dst_u32[4]), "=r"(dst_u32[5]), "=r"(dst_u32[6]), "=r"(dst_u32[7])
+        : "l"(src_char + 16)
+    );
+}
+
+/*
+ * Optimized (v1) inner implementation: process 16 elements per thread for increased ILP.
+ *
+ * Key differences from cvt_warp_fp16_to_fp4 (v0, 8 elements/thread):
+ * - Input: PackedVec_Opt with 8 half2/bfloat162 (16 elements, 32 bytes)
+ * - Output: uint64_t (16 e2m1 values)
+ * - SF thread cooperation:
+ *   - SF_VEC_SIZE=16: CVT_NUM_THREADS_PER_SF=1 (single thread, no shuffle)
+ *   - SF_VEC_SIZE=32: CVT_NUM_THREADS_PER_SF=2 (two threads, one shuffle)
+ *
+ * More compute per memory load hides L1TEX scoreboard stall (~7 cycles, ~40% of CPI).
+ */
+template <class Type, int SF_VEC_SIZE, bool UE8M0_SF, typename VecType>
+__device__ uint64_t cvt_warp_fp16_to_fp4_impl_opt(VecType& vec, float SFScaleVal, uint8_t* SFout)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    // Get absolute maximum values among the local 16 values (8 vec2 elements).
+    auto localMax = cuda_abs(vec.elts[0]);
+
+#pragma unroll
+    for (int i = 1; i < CVT_OPT_ELTS_PER_THREAD / 2; i++)
+    {
+        localMax = cuda_max(localMax, cuda_abs(vec.elts[i]));
+    }
+
+    // SF thread cooperation:
+    // - SF_VEC_SIZE=16, CVT_OPT_ELTS_PER_THREAD=16: CVT_NUM_THREADS_PER_SF=1 (single thread)
+    // - SF_VEC_SIZE=32, CVT_OPT_ELTS_PER_THREAD=16: CVT_NUM_THREADS_PER_SF=2 (two threads)
+    constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_OPT_ELTS_PER_THREAD;
+    static_assert(CVT_NUM_THREADS_PER_SF == 1 || CVT_NUM_THREADS_PER_SF == 2,
+        "v1 only supports SF_VEC_SIZE of 16 (1 thread) or 32 (2 threads)");
+
+    // Cross-thread max reduction only needed when two threads share one SF slot.
+    if constexpr (CVT_NUM_THREADS_PER_SF == 2)
+    {
+        localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+    }
+
+    float vecMax = float(cuda_max(localMax.x, localMax.y));
+
+    uint8_t fp8SFVal;
+    float outputScale;
+    if constexpr (UE8M0_SF)
+    {
+        __nv_fp8_e8m0 tmp;
+        vecMax *= reciprocal_approximate_ftz(6.0f);
+        tmp.__x = __nv_cvt_float_to_e8m0(vecMax, __NV_SATFINITE, cudaRoundPosInf);
+        fp8SFVal = tmp.__x;
+        outputScale = vecMax != 0 ? exp2f_rcp(fp8SFVal) : 0.0f;
+    }
+    else
+    {
+        // maximum value of e2m1 = 6.0
+        auto SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
+        __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
+        fp8SFVal = tmp.__x;
+        SFValue = static_cast<float>(tmp);
+        outputScale = vecMax != 0 ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal)) : 0.0f;
+    }
+
+    if (SFout)
+    {
+        *SFout = fp8SFVal;
+    }
+
+    // Convert the input to float: 8 vec2 elements = 16 floats.
+    float2 fp2Vals[CVT_OPT_ELTS_PER_THREAD / 2];
+
+#pragma unroll
+    for (int i = 0; i < CVT_OPT_ELTS_PER_THREAD / 2; i++)
+    {
+        if constexpr (std::is_same_v<Type, half>)
+        {
+            fp2Vals[i] = __half22float2(vec.elts[i]);
+        }
+        else
+        {
+            fp2Vals[i] = __bfloat1622float2(vec.elts[i]);
+        }
+        fp2Vals[i].x *= outputScale;
+        fp2Vals[i].y *= outputScale;
+    }
+
+    // Convert 16 floats to 16 e2m1 values packed in uint64_t.
+    uint64_t e2m1Vec = fp32_vec_to_e2m1(fp2Vals);
+    return e2m1Vec;
+#else
+    return 0;
+#endif
+}
+
+/*
+ * v1 Kernel: Optimized 16 elements per thread for increased ILP (FP16/BF16 to FP4 only).
+ *
+ * This kernel processes 16 elements per thread instead of 8, doubling the
+ * compute work per memory load. This helps hide L1TEX scoreboard stalls
+ * by providing more independent operations for the scheduler.
+ *
+ * Key differences from v0 (quantize_with_block_size):
+ * - ELTS_PER_THREAD: 16 instead of 8
+ * - PackedVec: 32 bytes instead of 16 bytes (32-byte aligned vectorized load via load_256bit)
+ * - Output: uint64_t (16 e2m1 values) instead of uint32_t (8 e2m1 values)
+ * - numColThreads: numCols / 16 instead of numCols / 8
+ *
+ * NOTE: This v1 kernel only supports FP16/BF16 to FP4 quantization.
+ * FP8 to FP4 and FP16 to MXFP8 are not supported in v1.
+ */
+template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    __launch_bounds__(512, 4) opt_quantize_with_block_size_v1(
+#else
+opt_quantize_with_block_size_v1(
+#endif
+        int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
+        float const* SFScale, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+
+    // v1 only supports FP16/BF16 to FP4 quantization.
+    static_assert(quantization_type == BlockScaleQuantizationType::FP16_TO_FP4,
+        "opt_quantize_with_block_size_v1 only supports FP16_TO_FP4 quantization type");
+
+    static constexpr int ELTS_PER_THREAD = CVT_OPT_ELTS_PER_THREAD;
+    using PackedVec = PackedVec_Opt<Type>;
+    static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;
+    static_assert(sizeof(PackedVec) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
+    static_assert(CVT_NUM_THREADS_PER_SF == 1 || CVT_NUM_THREADS_PER_SF == 2,
+        "v1 only supports SF_VEC_SIZE of 16 (1 thread) or 32 (2 threads)");
+
+    float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+
+    bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED;
+    int numPaddedRowsForSf = isSfSwizzledLayout ? PadUpFn(numRows, 128) : numRows;
+    int numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_VEC_SIZE) : numPaddedCols;
+
+    // v1 processes 16 elements per thread, so numColThreads = numCols / 16.
+    int numColThreads = numCols / ELTS_PER_THREAD;
+    int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
+    int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
+
+    asm volatile("griddepcontrol.wait;");
+    for (int rowIdx = blockIdx.x; rowIdx < numPaddedRowsForSf; rowIdx += gridDim.x)
+    {
+        for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
+        {
+            for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x)
+            {
+                std::optional<int> optionalBatchIdx = batchIdx;
+                std::optional<int> optionalNumRows = numRows;
+
+                // Each thread covers SF_VEC_SIZE/16 = 1 or 2 SF slots.
+                auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
+                    optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numPaddedCols / SF_VEC_SIZE, SFout, layout);
+
+                int64_t inOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx;
+                int64_t outOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numPaddedColThreads + colIdx;
+
+                // Zero out padded columns in the output tensor.
+                if (rowIdx < numRows && colIdx >= numColThreads && colIdx < numPaddedColThreads)
+                {
+                    // v1 outputs uint64_t (16 e2m1 values).
+                    reinterpret_cast<uint64_t*>(out)[outOffset] = 0ull;
+                }
+
+                // Zero out SF for padding rows or padding columns.
+                if (rowIdx >= numRows || colIdx >= numColThreads)
+                {
+                    if (sf_out != nullptr)
+                    {
+                        sf_out[0] = 0x00;
+                    }
+                }
+                else
+                {
+                    // Load the input vector using 256-bit vectorized load (two 128-bit loads).
+                    // This guarantees LDG.E.128 instructions in SASS. See load_256bit() for details.
+                    PackedVec in_vec;
+                    load_256bit(&in_vec, reinterpret_cast<char const*>(in) + inOffset * sizeof(PackedVec));
+
+                    // Dispatch the v1 quantization implementation (16 elements, uint64_t output).
+                    reinterpret_cast<uint64_t*>(out)[outOffset]
+                        = cvt_warp_fp16_to_fp4_impl_opt<Type, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+                }
+            }
+        }
+    }
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+__global__ void block_scale_interleave_kernel(
+    int numbatches, int numRows, int numCols, uint8_t const* SFIn, uint8_t* SFOutput);
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

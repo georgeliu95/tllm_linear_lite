@@ -242,6 +242,23 @@ Derived from `tensorrt_llm/kernels/quantization.*`:
 - **Kept** FP4 block quantization, block scale interleave, per-token global scale
 - See comment blocks at top of each `.h` / `.cuh` / `.cu` file for detailed diff
 
+#### Kernel versions
+
+| Version | Kernel | Elements/thread | Load width | Status |
+|---------|--------|-----------------|------------|--------|
+| v0 | `quantize_with_block_size` | 8 | 128-bit (LDG.E.128×1) | ✅ ported |
+| v1 | `opt_quantize_with_block_size_v1` | 16 | 256-bit (LDG.E.128×2) | ✅ ported |
+
+**v1 优化说明**：v0 每 thread 处理 8 个元素（16B load），v1 将其翻倍至 16 个元素（32B load，通过两次连续 LDG.E.128 实现）。更多的 compute-per-load 使 scheduler 有更多独立指令可调度，从而隐藏 L1TEX scoreboard stall（约 7 cycles，占 CPI 的 40%）。v1 引入的新组件：
+- `CVT_OPT_ELTS_PER_THREAD = 16`（常量）
+- `PackedVec_Opt<T>`（32B 对齐的 32 字节向量类型）
+- `load_256bit()`（两次 128-bit inline asm load，保证生成 LDG.E.128）
+- `cvt_warp_fp16_to_fp4_impl_opt()`（16 元素内层实现，输出 `uint64_t`）
+- `opt_quantize_with_block_size_v1`（只支持 FP16/BF16→FP4，`__launch_bounds__(512, 4)`）
+- dispatch 侧新增 `kernelVersion` 参数（0=v0, 1=v1）
+
+> v1 只支持 FP16/BF16→FP4，FP8→FP4 和 FP16→MXFP8 仍使用 v0。
+
 ### GEMM kernels (`gemm/`)
 
 - **CUTLASS** (`gemm/cutlass_fp4/`): copied from `kernels/cutlass_kernels/fp4_gemm/`, replaced all TRT-LLM headers with `trtllm_cutlass_compat.h`, removed MXFP8 dispatch/instantiations, created minimal `cutlass_type_conversion.h` (no NvInferRuntime.h). Covers SM100, SM103, SM120 with 51 kernel instantiations per dtype.
@@ -268,6 +285,7 @@ See comment blocks at top of each file for detailed diff from TRT-LLM originals.
 - [x] Cute DSL NVFP4 GEMM -- Python-based Blackwell kernels (SM100/103, JIT compiled)
 - [x] cuBLASLt bias epilogue -- `nvfp4_gemm(..., bias=...)` uses fused epilogue on cublaslt backend
 - [x] Optional fouroversix wrapper -- `tllm_linear_lite.quantize.fp4_quantize(..., backend="fouroversix")`
+- [x] **Quantize kernel v1** -- 16 elements/thread, 32B vectorized load (LDG.E.128×2), 更多 ILP 以隐藏 L1TEX scoreboard stall；`invokeFP4Quantization` 新增 `kernelVersion` 参数（0=v0, 1=v1，默认 v1）；仅 FP16/BF16→FP4 路径
 - [ ] Bias epilogue fusion for non-cuBLASLt backends (cutlass/cuda_core/cutedsl)
 - [ ] FourOverSix adaptive block scaling in native CUDA quantize path
 - [x] End-to-end NVFP4 Linear -- `NVFP4DynamicLinear` fused quantize + GEMM `nn.Module` (tllm + fouroversix quant backends)

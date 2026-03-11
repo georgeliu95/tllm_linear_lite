@@ -63,18 +63,20 @@ constexpr auto SF_DTYPE = torch::ScalarType::Byte;
 
 /// Quantize a 2D+ tensor from fp16/bf16/fp8 to FP4 (E2M1) with block scaling.
 ///
-/// @param self          Input tensor [*, K], fp16/bf16/fp8_e4m3
-/// @param globalScale   Optional [1] float tensor = (448 * 6) / self.abs().max()
-/// @param sfVecSize     Scale factor vector size: 16 (NVFP4) or 32 (MXFP4)
-/// @param sfUseUE8M0    If true, use UE8M0 scale factors (MXFP4 style)
+/// @param self               Input tensor [*, K], fp16/bf16/fp8_e4m3
+/// @param globalScale        Optional [1] float tensor = (448 * 6) / self.abs().max()
+/// @param sfVecSize          Scale factor vector size: 16 (NVFP4) or 32 (MXFP4)
+/// @param sfUseUE8M0         If true, use UE8M0 scale factors (MXFP4 style)
 /// @param isSfSwizzledLayout If true, scale factors in swizzled layout for CUTLASS
+/// @param kernelVersion      0=v0 (8 elems/thread), 1=v1 (16 elems/thread, better ILP, FP16/BF16 only)
 /// @return (fp4_values, scale_factors) tuple
 std::tuple<at::Tensor, at::Tensor> fp4_quantize(
     at::Tensor const& self,
     std::optional<at::Tensor> const& globalScale,
     int64_t sfVecSize,
     bool sfUseUE8M0,
-    bool isSfSwizzledLayout)
+    bool isSfSwizzledLayout,
+    int64_t kernelVersion = 1)
 {
     CHECK_TH_CUDA(self);
     CHECK_CONTIGUOUS(self);
@@ -135,7 +137,8 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(
         globalScalePtr,                                                                     \
         reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                   \
         reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()),                                  \
-        sfUseUE8M0, layout, mMultiProcessorCount, stream)
+        sfUseUE8M0, layout, mMultiProcessorCount, stream,                                   \
+        static_cast<int>(kernelVersion))
 
     if (sfUseUE8M0)
     {
@@ -292,7 +295,8 @@ TORCH_LIBRARY_FRAGMENT(tllm_linear_lite, m)
 {
     m.def(
         "fp4_quantize(Tensor input, Tensor? globalScale, int sfVecSize, "
-        "bool sfUseUE8M0=False, bool isSfSwizzledLayout=True) -> (Tensor, Tensor)");
+        "bool sfUseUE8M0=False, bool isSfSwizzledLayout=True, "
+        "int kernelVersion=1) -> (Tensor, Tensor)");
     m.def("calculate_nvfp4_global_scale(Tensor input, Tensor? tokensPerBatch) -> Tensor");
 }
 
