@@ -47,6 +47,7 @@ import nvtx
 # Load tllm_linear_lite CUDA extension
 import tllm_linear_lite  # noqa: F401
 from tllm_linear_lite.quantize import FOUROVERSIX_AVAILABLE, fp4_quantize as fp4_quantize_unified
+from tllm_linear_lite.amax.triton_amax import triton_amax
 
 
 # ============================================================================
@@ -252,22 +253,27 @@ def quantize(
 
 def measure_scale_computation(
     input_tensor: torch.Tensor,
+    quant_range: float = 448.0 * 6.0,
     warmup: int = 3,
     repeat: int = 10,
 ) -> Tuple[float, float]:
-    """Measure the time for global scale computation (fixed overhead).
+    """Measure the time for global scale computation (triton_amax + division).
+
+    Uses triton_amax (Triton partial reduction + PyTorch .max() final) instead
+    of the naive abs().amax() path.
 
     Args:
-        input_tensor: Input tensor
-        warmup: Number of warmup iterations
-        repeat: Number of timed iterations
+        input_tensor: Input tensor.
+        quant_range: Numerator for scale computation (default: 2688 for NVFP4).
+        warmup: Number of warmup iterations.
+        repeat: Number of timed iterations.
 
     Returns:
         (act_global_scale, avg_time_us)
     """
     with nvtx.annotate("scale_computation/warmup"):
         for _ in range(warmup):
-            _ = 448.0 * 6.0 / input_tensor.abs().amax().float()
+            _ = quant_range / triton_amax(input_tensor)
         torch.cuda.synchronize()
 
     times = []
@@ -278,7 +284,7 @@ def measure_scale_computation(
 
             rng = nvtx.start_range(f"scale_computation/iter_{i}")
             start.record()
-            act_global_scale = 448.0 * 6.0 / input_tensor.abs().amax().float()
+            act_global_scale = quant_range / triton_amax(input_tensor)
             end.record()
             nvtx.end_range(rng)
 
@@ -402,6 +408,29 @@ def test_accuracy(input_tensor: torch.Tensor) -> bool:
             "err": kernel_err,
             "rel_err": kernel_err / input_flat.abs().clamp(min=1e-6),
         }
+
+        # --- tllm adaptive 4/6 (native CUDA, streaming kernel) ---
+        _ADAPTIVE_RULES = ("mse", "mae", "abs_max")
+        for rule in _ADAPTIVE_RULES:
+            try:
+                adapt_fp4, adapt_sf = fp4_quantize_unified(
+                    input_tensor, backend="tllm", swizzled=False, scale_rule=rule,
+                )
+                adapt_fp4_float, adapt_sf_float = unpack_cuda_fp4_output(
+                    adapt_fp4, adapt_sf, M, K, block_size
+                )
+                # FourOverSix uses encode_scale=1536/amax
+                adapt_gs = (6.0 * 256.0 / input_tensor.abs().amax().float()).item()
+                adapt_dequant = dequantize_fp4(
+                    adapt_fp4_float, adapt_sf_float, adapt_gs, block_size
+                )
+                adapt_err = (adapt_dequant - input_flat).abs()
+                backends[f"tllm({rule})"] = {
+                    "err": adapt_err,
+                    "rel_err": adapt_err / input_flat.abs().clamp(min=1e-6),
+                }
+            except Exception as e:
+                print(f"\n  [WARN] tllm adaptive ({rule}) failed: {e}")
 
         # --- fouroversix (multiple scale rules) ---
         _F46_SCALE_RULES = ("mse", "abs_max", "mae")
@@ -640,11 +669,16 @@ def benchmark(
         peak_bw = 2.0  # conservative estimate
 
     # ================================================================
-    # tllm baseline: scale computation (footnote) + kernel
+    # tllm baseline: prologue (triton_amax) + kernel, measured both ways
     # ================================================================
+    from tllm_linear_lite.quantize import (
+        _SCALE_RULE_MAP, _TLLM_QUANT_RANGE, _FOUROVERSIX_QUANT_RANGE,
+    )
+
     with nvtx.annotate("benchmark/scale_computation"):
         act_global_scale, scale_time_us = measure_scale_computation(
-            input_tensor, warmup=warmup, repeat=repeat
+            input_tensor, quant_range=_TLLM_QUANT_RANGE,
+            warmup=warmup, repeat=repeat,
         )
 
     with nvtx.annotate("benchmark/tllm_fp4_quantize"):
@@ -652,11 +686,88 @@ def benchmark(
             input_tensor, act_global_scale, warmup=warmup, repeat=repeat
         )
 
+    tllm_e2e_us = scale_time_us + tllm_kernel_us
+
     output_bytes = (
         act_fp4.numel() * act_fp4.element_size()
         + act_sf.numel() * act_sf.element_size()
     )
     total_bytes = data_bytes + output_bytes
+
+    # ================================================================
+    # tllm adaptive 4/6: end-to-end (triton_amax → scale → kernel)
+    # ================================================================
+    _ADAPTIVE_RULES = ("mse", "abs_max", "mae")
+    adaptive_kernel_times: dict[str, float] = {}
+    adaptive_e2e_times: dict[str, float] = {}
+
+    for rule in _ADAPTIVE_RULES:
+        try:
+            scale_rule_int = _SCALE_RULE_MAP[rule]
+            scaling_vector_size = 16
+
+            # Kernel-only timing (scale precomputed)
+            adaptive_global_scale = (_FOUROVERSIX_QUANT_RANGE / triton_amax(input_tensor)).item()
+            adaptive_gs_tensor = torch.tensor(adaptive_global_scale, dtype=torch.float32, device=input_tensor.device)
+
+            with nvtx.annotate(f"benchmark/tllm_{rule}/warmup"):
+                for _ in range(warmup):
+                    _ = torch.ops.tllm_linear_lite.fp4_quantize(
+                        input_tensor, adaptive_gs_tensor, scaling_vector_size, False, True,
+                        1, scale_rule_int,
+                    )
+                torch.cuda.synchronize()
+
+            kernel_times = []
+            with nvtx.annotate(f"benchmark/tllm_{rule}/kernel"):
+                for i in range(repeat):
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    rng = nvtx.start_range(f"tllm_{rule}/kernel_{i}")
+                    start.record()
+                    _ = torch.ops.tllm_linear_lite.fp4_quantize(
+                        input_tensor, adaptive_gs_tensor, scaling_vector_size, False, True,
+                        1, scale_rule_int,
+                    )
+                    end.record()
+                    nvtx.end_range(rng)
+                    torch.cuda.synchronize()
+                    kernel_times.append(start.elapsed_time(end) * 1000)
+
+            adaptive_kernel_times[rule] = sum(kernel_times) / len(kernel_times)
+
+            # End-to-end timing (triton_amax → scale → kernel)
+            with nvtx.annotate(f"benchmark/tllm_{rule}/e2e_warmup"):
+                for _ in range(warmup):
+                    gs = _FOUROVERSIX_QUANT_RANGE / triton_amax(input_tensor)
+                    gs_t = torch.tensor(gs.item(), dtype=torch.float32, device=input_tensor.device)
+                    _ = torch.ops.tllm_linear_lite.fp4_quantize(
+                        input_tensor, gs_t, scaling_vector_size, False, True,
+                        1, scale_rule_int,
+                    )
+                torch.cuda.synchronize()
+
+            e2e_times = []
+            with nvtx.annotate(f"benchmark/tllm_{rule}/e2e"):
+                for i in range(repeat):
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    rng = nvtx.start_range(f"tllm_{rule}/e2e_{i}")
+                    start.record()
+                    gs = _FOUROVERSIX_QUANT_RANGE / triton_amax(input_tensor)
+                    gs_t = torch.tensor(gs.item(), dtype=torch.float32, device=input_tensor.device)
+                    _ = torch.ops.tllm_linear_lite.fp4_quantize(
+                        input_tensor, gs_t, scaling_vector_size, False, True,
+                        1, scale_rule_int,
+                    )
+                    end.record()
+                    nvtx.end_range(rng)
+                    torch.cuda.synchronize()
+                    e2e_times.append(start.elapsed_time(end) * 1000)
+
+            adaptive_e2e_times[rule] = sum(e2e_times) / len(e2e_times)
+        except Exception as e:
+            print(f"\n  [WARN] tllm adaptive ({rule}) benchmark failed: {e}")
 
     # ================================================================
     # fouroversix: each scale rule measured separately
@@ -666,15 +777,18 @@ def benchmark(
 
     if FOUROVERSIX_AVAILABLE:
         from fouroversix import QuantizationConfig as F46Config
+        from fouroversix.utils import ScaleRule as F46ScaleRule
+
+        _F46_RULE_MAP = {"mse": F46ScaleRule.mse, "abs_max": F46ScaleRule.abs_max, "mae": F46ScaleRule.mae}
 
         for rule in _F46_SCALE_RULES:
             try:
-                config = F46Config(scale_rule=rule)
+                f46_rule_int = _F46_RULE_MAP[rule].cuda_id()
 
                 with nvtx.annotate(f"benchmark/f46_{rule}/warmup"):
                     for _ in range(warmup):
-                        _ = fp4_quantize_unified(
-                            input_tensor, backend="fouroversix", config=config
+                        _ = torch.ops.fouroversix.quantize_to_fp4(
+                            input_tensor, True, True, False, False, False, f46_rule_int, 0,
                         )
                     torch.cuda.synchronize()
 
@@ -685,8 +799,8 @@ def benchmark(
                         end = torch.cuda.Event(enable_timing=True)
                         rng = nvtx.start_range(f"f46_{rule}/iter_{i}")
                         start.record()
-                        _ = fp4_quantize_unified(
-                            input_tensor, backend="fouroversix", config=config
+                        _ = torch.ops.fouroversix.quantize_to_fp4(
+                            input_tensor, True, True, False, False, False, f46_rule_int, 0,
                         )
                         end.record()
                         nvtx.end_range(rng)
@@ -703,11 +817,21 @@ def benchmark(
     # Unified performance table (tllm = baseline)
     # ================================================================
     col_names: list[str] = ["tllm"]
-    col_times: list[float] = [tllm_kernel_us]
+    kernel_times: list[float] = [tllm_kernel_us]
+    e2e_times_list: list[float] = [tllm_e2e_us]
+    kernel_only_col: list[bool] = [True]
+    for rule in _ADAPTIVE_RULES:
+        if rule in adaptive_kernel_times:
+            col_names.append(f"tllm({rule})")
+            kernel_times.append(adaptive_kernel_times[rule])
+            e2e_times_list.append(adaptive_e2e_times.get(rule, adaptive_kernel_times[rule]))
+            kernel_only_col.append(True)
     for rule in _F46_SCALE_RULES:
         if rule in f46_times:
             col_names.append(f"f46({rule})")
-            col_times.append(f46_times[rule])
+            kernel_times.append(f46_times[rule])
+            e2e_times_list.append(f46_times[rule])
+            kernel_only_col.append(False)
 
     col_w = 14
     header = f"  {'Metric':<25}" + "".join(f"{n:>{col_w}}" for n in col_names)
@@ -716,34 +840,51 @@ def benchmark(
     print(f"\n{header}")
     print(sep)
 
-    # Kernel time
-    print(f"  {'Kernel time (us)':<25}" + "".join(
-        f"{t:>{col_w}.2f}" for t in col_times
+    # Kernel-only time
+    print(f"  {'Kernel only (us)':<25}" + "".join(
+        f"{t:>{col_w}.2f}" for t in kernel_times
     ))
 
-    # Effective bandwidth
-    bws = [total_bytes / (t * 1e-6) / 1e12 for t in col_times]
-    print(f"  {'Effective BW (TB/s)':<25}" + "".join(
+    # End-to-end time (prologue + kernel for tllm; f46 already includes prologue)
+    print(f"  {'End-to-end (us)':<25}" + "".join(
+        f"{t:>{col_w}.2f}" for t in e2e_times_list
+    ))
+
+    # Effective bandwidth (based on end-to-end time)
+    bws = [total_bytes / (t * 1e-6) / 1e12 for t in e2e_times_list]
+    print(f"  {'E2E BW (TB/s)':<25}" + "".join(
         f"{bw:>{col_w}.2f}" for bw in bws
     ))
 
-    # Memory bandwidth utilization
+    # Memory bandwidth utilization (based on end-to-end time)
     mbus = [bw / peak_bw * 100 for bw in bws]
-    print(f"  {'MBU %':<25}" + "".join(
+    print(f"  {'E2E MBU %':<25}" + "".join(
         f"{m:>{col_w - 1}.1f}%" for m in mbus
     ))
 
-    # Latency ratio vs tllm baseline (>1 means slower than tllm)
-    if len(col_times) > 1:
-        print(f"  {'Latency vs tllm':<25}" + "".join(
-            f"{'1.00x':>{col_w}}" if i == 0
-            else f"{t / tllm_kernel_us:>{col_w - 1}.2f}x"
-            for i, t in enumerate(col_times)
+    # Kernel speedup vs tllm (N/A for f46 whose kernel time includes prologue)
+    if len(kernel_times) > 1:
+        def _kernel_speedup(i: int, t: float) -> str:
+            if i == 0:
+                return f"{'1.00x':>{col_w}}"
+            if not kernel_only_col[i]:
+                return f"{'N/A':>{col_w}}"
+            return f"{tllm_kernel_us / t:>{col_w - 1}.2f}x"
+
+        print(f"  {'Kernel speedup':<25}" + "".join(
+            _kernel_speedup(i, t) for i, t in enumerate(kernel_times)
         ))
 
-    # Scale computation footnote (PyTorch abs.amax, not part of tllm kernel)
-    print(f"\n  Note: global scale (abs.amax) overhead = {scale_time_us:.2f} us"
-          f" (not included in kernel times above)")
+    # E2E speedup vs tllm (>1 means faster than tllm)
+    if len(e2e_times_list) > 1:
+        print(f"  {'E2E speedup':<25}" + "".join(
+            f"{'1.00x':>{col_w}}" if i == 0
+            else f"{tllm_e2e_us / t:>{col_w - 1}.2f}x"
+            for i, t in enumerate(e2e_times_list)
+        ))
+
+    print(f"\n  Prologue: triton_amax = {scale_time_us:.2f} us"
+          f" (included in end-to-end; f46 includes its own prologue)")
 
     # Output statistics
     print(f"\n  Output statistics:")
@@ -762,6 +903,11 @@ def run_ncu_mode(input_tensor: torch.Tensor):
     print("Warmup...")
     for _ in range(3):
         _ = quantize(input_tensor)
+    for rule in ("mse", "abs_max", "mae"):
+        for _ in range(3):
+            _ = fp4_quantize_unified(
+                input_tensor, backend="tllm", swizzled=True, scale_rule=rule,
+            )
     if FOUROVERSIX_AVAILABLE:
         from fouroversix import QuantizationConfig as F46Config
         for rule in ("mse", "abs_max", "mae"):
@@ -780,6 +926,15 @@ def run_ncu_mode(input_tensor: torch.Tensor):
         with nvtx.annotate("tllm_linear_lite/fp4_quantize"):
             act_fp4, act_sf = quantize(input_tensor)
             torch.cuda.synchronize()
+
+        # ------------------------------------------------------------------ tllm adaptive 4/6
+        for rule in ("mse", "abs_max", "mae"):
+            print(f"Profiling fp4_quantize adaptive (scale_rule={rule})...")
+            with nvtx.annotate(f"tllm_linear_lite/fp4_quantize_adaptive/{rule}"):
+                _ = fp4_quantize_unified(
+                    input_tensor, backend="tllm", swizzled=True, scale_rule=rule,
+                )
+                torch.cuda.synchronize()
 
         print("Profiling calculate_nvfp4_global_scale (tllm_linear_lite)...")
         with nvtx.annotate("tllm_linear_lite/global_scale"):
@@ -820,6 +975,11 @@ def main():
     )
     parser.add_argument("--skip-verify", action="store_true", help="Skip correctness verification")
     parser.add_argument("--compare-trtllm", action="store_true", help="Compare with TensorRT-LLM")
+    parser.add_argument(
+        "--scale-rule", type=str, default=None,
+        choices=["mse", "mae", "abs_max"],
+        help="Run adaptive 4/6 quantize with specified scale rule (standalone benchmark)"
+    )
     args = parser.parse_args()
 
     shape = tuple(map(int, args.shape.split(",")))
@@ -837,6 +997,58 @@ def main():
 
     if args.ncu:
         run_ncu_mode(input_tensor)
+    elif args.scale_rule:
+        # Standalone adaptive 4/6 benchmark
+        rule = args.scale_rule
+        print(f"\nAdaptive 4/6 benchmark (scale_rule={rule})")
+        print("-" * 60)
+
+        for _ in range(args.warmup):
+            _ = fp4_quantize_unified(input_tensor, backend="tllm", swizzled=True, scale_rule=rule)
+        torch.cuda.synchronize()
+
+        times = []
+        for _ in range(args.repeat):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            fp4, sf = fp4_quantize_unified(input_tensor, backend="tllm", swizzled=True, scale_rule=rule)
+            end.record()
+            torch.cuda.synchronize()
+            times.append(start.elapsed_time(end) * 1000)  # us
+
+        avg_us = sum(times) / len(times)
+        n_bytes = input_tensor.numel() * input_tensor.element_size()
+        out_bytes = fp4.numel() * fp4.element_size() + sf.numel() * sf.element_size()
+        bw_tb = (n_bytes + out_bytes) / (avg_us * 1e-6) / 1e12
+
+        print(f"  Kernel time:    {avg_us:.2f} us")
+        print(f"  Effective BW:   {bw_tb:.2f} TB/s")
+        print(f"  Output shape:   fp4={fp4.shape}, sf={sf.shape}")
+
+        # Quick accuracy check vs fouroversix if available
+        if FOUROVERSIX_AVAILABLE:
+            from fouroversix import QuantizationConfig as F46Config
+            config = F46Config(scale_rule=rule)
+            f46_qt = fp4_quantize_unified(input_tensor, backend="fouroversix", config=config)
+            f46_dq = f46_qt.dequantize(dtype=torch.bfloat16).float()
+            M, K = input_tensor.shape[0], input_tensor.shape[-1]
+            input_flat = input_tensor.float().reshape(-1, K)
+            if f46_dq.shape != input_flat.shape:
+                f46_dq = f46_dq[:input_flat.shape[0], :input_flat.shape[1]]
+
+            # tllm adaptive dequant
+            gs = (6.0 * 256.0 / triton_amax(input_tensor)).item()
+            fp4_f, sf_f = unpack_cuda_fp4_output(
+                *fp4_quantize_unified(input_tensor, backend="tllm", swizzled=False, scale_rule=rule),
+                M, K, 16
+            )
+            tllm_dq = dequantize_fp4(fp4_f, sf_f, gs, 16)
+
+            tllm_err = (tllm_dq - input_flat).abs().mean().item()
+            f46_err = (f46_dq - input_flat).abs().mean().item()
+            print(f"\n  Mean abs error:  tllm({rule})={tllm_err:.6f}  f46({rule})={f46_err:.6f}")
+            print(f"  Error ratio (tllm/f46): {tllm_err / max(f46_err, 1e-10):.4f}")
     else:
         if not args.skip_verify:
             if not test_accuracy(input_tensor):

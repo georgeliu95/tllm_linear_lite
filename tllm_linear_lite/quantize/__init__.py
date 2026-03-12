@@ -50,12 +50,27 @@ except Exception as exc:
     )
 
 
+_SCALE_RULE_MAP = {
+    "static_6": 0,
+    "static_4": 0,
+    "mse": 1,
+    "mae": 2,
+    "abs_max": 3,
+}
+
+# Standard NVFP4: max_e2m1=6, max_e4m3=448 → encode_scale = 2688/amax
+_TLLM_QUANT_RANGE = 6.0 * 448.0  # 2688
+# FourOverSix adaptive: max_e2m1=6, max_e4m3=256 → encode_scale = 1536/amax
+_FOUROVERSIX_QUANT_RANGE = 6.0 * 256.0  # 1536
+
+
 def fp4_quantize(
     x: torch.Tensor,
     *,
     backend: str = "tllm",
     global_scale: torch.Tensor | float | None = None,
     swizzled: bool = True,
+    scale_rule: str = "static_6",
     **kwargs: Any,
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], Any]:
     """
@@ -64,8 +79,13 @@ def fp4_quantize(
     Args:
         x: Input tensor (2D, bfloat16 or float16, CUDA).
         backend: "tllm" (native CUDA op) or "fouroversix" (optional).
-        global_scale: For tllm backend only. If None, computed as 448*6/amax.
+        global_scale: For tllm backend only. If None, auto-computed from amax.
         swizzled: For tllm backend only. Scale factor layout.
+        scale_rule: Block scale selection rule (tllm backend only).
+            "static_6" (default) — standard NVFP4, all blocks use scale 6.
+            "mse" / "mae" / "abs_max" — FourOverSix adaptive 4/6 selection,
+            choosing per-block between scale 4 and 6 to minimize the given
+            error metric. Uses encode_scale=1536/amax instead of 2688/amax.
         **kwargs: Passed to fouroversix when backend="fouroversix" (e.g. config=...).
 
     Returns:
@@ -73,8 +93,18 @@ def fp4_quantize(
         - If backend="fouroversix": fouroversix QuantizedTensor (has .dequantize()).
     """
     if backend == "tllm":
+        scale_rule_int = _SCALE_RULE_MAP.get(scale_rule)
+        if scale_rule_int is None:
+            raise ValueError(
+                f"Unknown scale_rule: {scale_rule!r}. "
+                f"Choose from {list(_SCALE_RULE_MAP.keys())}."
+            )
+
+        is_adaptive = scale_rule_int != 0
+        quant_range = _FOUROVERSIX_QUANT_RANGE if is_adaptive else _TLLM_QUANT_RANGE
+
         if global_scale is None:
-            global_scale = (448.0 * 6.0 / x.abs().amax().float()).item()
+            global_scale = (quant_range / x.abs().amax().float()).item()
         if isinstance(global_scale, float):
             global_scale_t = torch.tensor(
                 global_scale, dtype=torch.float32, device=x.device
@@ -83,7 +113,9 @@ def fp4_quantize(
             global_scale_t = global_scale
         scaling_vector_size = 16
         packed, sf = torch.ops.tllm_linear_lite.fp4_quantize(
-            x, global_scale_t, scaling_vector_size, False, swizzled
+            x, global_scale_t, scaling_vector_size, False, swizzled,
+            1,  # kernelVersion (v1 default)
+            scale_rule_int,
         )
         return (packed, sf)
 

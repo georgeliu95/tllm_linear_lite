@@ -916,6 +916,319 @@ opt_quantize_with_block_size_v1(
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// FourOverSix Adaptive 4/6 Block Scaling
+
+enum class AdaptiveScaleRule { NONE = 0, MSE = 1, MAE = 2, ABS_MAX = 3 };
+
+/*
+ * Fake-quantize 4 half2 values (8 elements) to E2M1, dequantize back, and
+ * accumulate error — all in a single register-efficient pass.
+ *
+ * Accepts half2 input directly (no float array materialization). Float
+ * conversion happens just-in-time inside the loop body, and the converted
+ * values are immediately consumed for scaling, error computation, then
+ * discarded — keeping register pressure minimal.
+ *
+ * Returns the packed E2M1 output (uint32_t = 8 nibbles).
+ */
+template <AdaptiveScaleRule Rule, class HalfType>
+__device__ __forceinline__ uint32_t fake_quant_e2m1_8(
+    HalfType const (&h2)[4], float outputScale, float decodeScale, float& err)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    // Convert half2 → float pair-by-pair, scale, and feed to PTX.
+    // Each float pair is a temporary — only 2 floats live at a time.
+    float s0, s1, s2, s3, s4, s5, s6, s7;
+    {
+        float2 f;
+        if constexpr (std::is_same_v<HalfType, __half2>)
+            f = __half22float2(h2[0]);
+        else
+            f = __bfloat1622float2(h2[0]);
+        s0 = f.x * outputScale; s1 = f.y * outputScale;
+
+        if constexpr (std::is_same_v<HalfType, __half2>)
+            f = __half22float2(h2[1]);
+        else
+            f = __bfloat1622float2(h2[1]);
+        s2 = f.x * outputScale; s3 = f.y * outputScale;
+
+        if constexpr (std::is_same_v<HalfType, __half2>)
+            f = __half22float2(h2[2]);
+        else
+            f = __bfloat1622float2(h2[2]);
+        s4 = f.x * outputScale; s5 = f.y * outputScale;
+
+        if constexpr (std::is_same_v<HalfType, __half2>)
+            f = __half22float2(h2[3]);
+        else
+            f = __bfloat1622float2(h2[3]);
+        s6 = f.x * outputScale; s7 = f.y * outputScale;
+    }
+
+    // Quantize 8 floats → 4 E2M1 byte pairs, packed into uint32.
+    uint32_t e2m1_packed;
+    asm(
+        "{\n"
+        ".reg .b8 byte0, byte1, byte2, byte3;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 byte1, %4, %3;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 byte2, %6, %5;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 byte3, %8, %7;\n"
+        "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+        "}"
+        : "=r"(e2m1_packed)
+        : "f"(s0), "f"(s1), "f"(s2), "f"(s3), "f"(s4), "f"(s5), "f"(s6), "f"(s7)
+    );
+
+    // Dequant + error: per-pair asm blocks allow compiler to interleave
+    // error computation between dequant results.
+#define DEQUANT_BYTE(IDX, BSEL)                                       \
+    uint32_t dq##IDX;                                                  \
+    asm(                                                               \
+        "{\n"                                                          \
+        ".reg .b8 b0, b1, b2, b3;\n"                                  \
+        "mov.b32 {b0, b1, b2, b3}, %1;\n"                             \
+        "cvt.rn.f16x2.e2m1x2 %0, " BSEL ";\n"                        \
+        "}\n"                                                          \
+        : "=r"(dq##IDX) : "r"(e2m1_packed)                            \
+    )
+
+#define ERROR_PAIR(IDX)                                                \
+    {                                                                  \
+        float2 orig;                                                   \
+        if constexpr (std::is_same_v<HalfType, __half2>)               \
+            orig = __half22float2(h2[IDX]);                            \
+        else                                                           \
+            orig = __bfloat1622float2(h2[IDX]);                        \
+        half2 dq_h = reinterpret_cast<half2&>(dq##IDX);               \
+        float2 dq_f = __half22float2(dq_h);                           \
+        dq_f.x *= decodeScale;                                        \
+        dq_f.y *= decodeScale;                                        \
+        float dx = dq_f.x - orig.x;                                   \
+        float dy = dq_f.y - orig.y;                                   \
+        if constexpr (Rule == AdaptiveScaleRule::MSE)                  \
+            err += dx * dx + dy * dy;                                  \
+        else if constexpr (Rule == AdaptiveScaleRule::MAE)             \
+            err += fabsf(dx) + fabsf(dy);                             \
+        else if constexpr (Rule == AdaptiveScaleRule::ABS_MAX)         \
+            err = fmaxf(err, fmaxf(fabsf(dx), fabsf(dy)));           \
+    }
+
+    DEQUANT_BYTE(0, "b0"); ERROR_PAIR(0);
+    DEQUANT_BYTE(1, "b1"); ERROR_PAIR(1);
+    DEQUANT_BYTE(2, "b2"); ERROR_PAIR(2);
+    DEQUANT_BYTE(3, "b3"); ERROR_PAIR(3);
+
+#undef DEQUANT_BYTE
+#undef ERROR_PAIR
+
+    return e2m1_packed;
+#else
+    return 0;
+#endif
+}
+
+/*
+ * Adaptive 4/6 inner implementation (streaming, 16 elements per thread).
+ *
+ * Sequentially computes fake-quant + error for r=6 then r=4, selecting the
+ * candidate with lower error. Only ~21 R32 registers at peak — no spilling.
+ *
+ * The r=4 candidate uses scale_expansion_factor=1.5 (sf_4 = sf_6_hp * 1.5),
+ * mapping input to E2M1 range [-4, 4] instead of [-6, 6]. This avoids the
+ * coarse 4→6 interval (gap=2) at the cost of one fewer quantization level.
+ *
+ * Both candidates' SF values fit in E4M3 (max 256 for r=6, max 384 for r=4,
+ * both < 448). The decoder is agnostic to the r choice — it simply uses
+ * x_reconstructed = e2m1_val * sf_e4m3 / SFScaleVal.
+ */
+template <class Type, int SF_VEC_SIZE, AdaptiveScaleRule Rule, typename VecType>
+__device__ uint64_t cvt_warp_fp16_to_fp4_adaptive(VecType& vec, float SFScaleVal, uint8_t* SFout)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    static_assert(Rule != AdaptiveScaleRule::NONE, "Use cvt_warp_fp16_to_fp4_impl_opt for non-adaptive");
+
+    // --- Step 1: Compute vecMax (same as v1) ---
+    auto localMax = cuda_abs(vec.elts[0]);
+#pragma unroll
+    for (int i = 1; i < CVT_OPT_ELTS_PER_THREAD / 2; i++)
+    {
+        localMax = cuda_max(localMax, cuda_abs(vec.elts[i]));
+    }
+
+    constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_OPT_ELTS_PER_THREAD;
+    static_assert(CVT_NUM_THREADS_PER_SF == 1 || CVT_NUM_THREADS_PER_SF == 2,
+        "adaptive only supports SF_VEC_SIZE of 16 (1 thread) or 32 (2 threads)");
+
+    if constexpr (CVT_NUM_THREADS_PER_SF == 2)
+    {
+        localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+    }
+
+    float vecMax = float(cuda_max(localMax.x, localMax.y));
+
+    // --- Step 2: Compute E4M3 SF candidates for r=6 and r=4 ---
+    float sf_hp = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
+    __nv_fp8_e4m3 sf_6_e4m3 = __nv_fp8_e4m3(sf_hp);
+    __nv_fp8_e4m3 sf_4_e4m3 = __nv_fp8_e4m3(sf_hp * 1.5f);
+
+    float rcp_SFScale = reciprocal_approximate_ftz(SFScaleVal);
+
+    // Zero-copy references to vec.elts lower/upper halves — no register copies.
+    using HalfVecT = typename TypeConverter<Type>::Type;
+    using Arr4Ref = HalfVecT const (&)[4];
+    Arr4Ref lo = reinterpret_cast<Arr4Ref>(vec.elts[0]);
+    Arr4Ref hi = reinterpret_cast<Arr4Ref>(vec.elts[4]);
+
+    // --- Step 3+4: r=6 fake-quant + error (stored as initial winner) ---
+    float best_err = 0.0f;
+    uint32_t e2m1_lo, e2m1_hi;
+    __nv_fp8_e4m3 sf_best = sf_6_e4m3;
+    {
+        float sf_f = static_cast<float>(sf_6_e4m3);
+        float decodeScale = sf_f * rcp_SFScale;
+        float outputScale = vecMax != 0 ? reciprocal_approximate_ftz(decodeScale) : 0.0f;
+        e2m1_lo = fake_quant_e2m1_8<Rule>(lo, outputScale, decodeScale, best_err);
+        e2m1_hi = fake_quant_e2m1_8<Rule>(hi, outputScale, decodeScale, best_err);
+    }
+
+    // --- Step 5: r=4 fake-quant + error ---
+    float err_4 = 0.0f;
+    uint32_t e2m1_4_lo, e2m1_4_hi;
+    {
+        float sf_f = static_cast<float>(sf_4_e4m3);
+        float decodeScale = sf_f * rcp_SFScale;
+        float outputScale = vecMax != 0 ? reciprocal_approximate_ftz(decodeScale) : 0.0f;
+        e2m1_4_lo = fake_quant_e2m1_8<Rule>(lo, outputScale, decodeScale, err_4);
+        e2m1_4_hi = fake_quant_e2m1_8<Rule>(hi, outputScale, decodeScale, err_4);
+    }
+
+    // --- Step 6: For SF_VEC_SIZE=32, reduce errors across 2 threads ---
+    if constexpr (CVT_NUM_THREADS_PER_SF == 2)
+    {
+        if constexpr (Rule == AdaptiveScaleRule::ABS_MAX)
+        {
+            best_err = fmaxf(best_err, __shfl_xor_sync(uint32_t(-1), best_err, 1));
+            err_4 = fmaxf(err_4, __shfl_xor_sync(uint32_t(-1), err_4, 1));
+        }
+        else
+        {
+            best_err += __shfl_xor_sync(uint32_t(-1), best_err, 1);
+            err_4 += __shfl_xor_sync(uint32_t(-1), err_4, 1);
+        }
+    }
+
+    // --- Step 7: Overwrite with r=4 if it produces lower error ---
+    if (err_4 < best_err)
+    {
+        e2m1_lo = e2m1_4_lo;
+        e2m1_hi = e2m1_4_hi;
+        sf_best = sf_4_e4m3;
+    }
+
+    if (SFout)
+    {
+        *SFout = sf_best.__x;
+    }
+
+    // Pack two uint32_t halves into one uint64_t.
+    uint64_t e2m1_out;
+    asm volatile("mov.b64 %0, {%1, %2};" : "=l"(e2m1_out) : "r"(e2m1_lo), "r"(e2m1_hi));
+    return e2m1_out;
+#else
+    return 0;
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// FourOverSix Adaptive Kernel: streaming 4/6 selection with per-thread sequential error comparison
+
+/*
+ * Adaptive kernel: same structure as opt_quantize_with_block_size_v1 but calls
+ * cvt_warp_fp16_to_fp4_adaptive for per-block 4/6 scale selection.
+ *
+ * Only supports FP16/BF16→FP4 with E4M3 scale factors (not UE8M0).
+ * The caller must pass globalScale = 1536/amax (not 2688/amax).
+ */
+template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, AdaptiveScaleRule Rule>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    __launch_bounds__(512, 3) opt_quantize_with_block_size_adaptive(
+#else
+opt_quantize_with_block_size_adaptive(
+#endif
+        int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
+        float const* SFScale, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+
+    static_assert(quantization_type == BlockScaleQuantizationType::FP16_TO_FP4,
+        "adaptive kernel only supports FP16_TO_FP4");
+    static_assert(Rule != AdaptiveScaleRule::NONE,
+        "use opt_quantize_with_block_size_v1 for non-adaptive quantization");
+
+    static constexpr int ELTS_PER_THREAD = CVT_OPT_ELTS_PER_THREAD;
+    using PackedVec = PackedVec_Opt<Type>;
+    static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;
+    static_assert(sizeof(PackedVec) == sizeof(Type) * ELTS_PER_THREAD, "Vec size mismatch.");
+    static_assert(CVT_NUM_THREADS_PER_SF == 1 || CVT_NUM_THREADS_PER_SF == 2,
+        "adaptive only supports SF_VEC_SIZE of 16 or 32");
+
+    float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+
+    bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED;
+    int numPaddedRowsForSf = isSfSwizzledLayout ? PadUpFn(numRows, 128) : numRows;
+    int numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_VEC_SIZE) : numPaddedCols;
+
+    int numColThreads = numCols / ELTS_PER_THREAD;
+    int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
+    int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
+
+    asm volatile("griddepcontrol.wait;");
+    for (int rowIdx = blockIdx.x; rowIdx < numPaddedRowsForSf; rowIdx += gridDim.x)
+    {
+        for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
+        {
+            for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x)
+            {
+                std::optional<int> optionalBatchIdx = batchIdx;
+                std::optional<int> optionalNumRows = numRows;
+
+                auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
+                    optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numPaddedCols / SF_VEC_SIZE, SFout, layout);
+
+                int64_t inOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx;
+                int64_t outOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numPaddedColThreads + colIdx;
+
+                if (rowIdx < numRows && colIdx >= numColThreads && colIdx < numPaddedColThreads)
+                {
+                    reinterpret_cast<uint64_t*>(out)[outOffset] = 0ull;
+                }
+
+                if (rowIdx >= numRows || colIdx >= numColThreads)
+                {
+                    if (sf_out != nullptr)
+                    {
+                        sf_out[0] = 0x00;
+                    }
+                }
+                else
+                {
+                    PackedVec in_vec;
+                    load_256bit(&in_vec, reinterpret_cast<char const*>(in) + inOffset * sizeof(PackedVec));
+
+                    reinterpret_cast<uint64_t*>(out)[outOffset]
+                        = cvt_warp_fp16_to_fp4_adaptive<Type, SF_VEC_SIZE, Rule>(in_vec, SFScaleVal, sf_out);
+                }
+            }
+        }
+    }
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 __global__ void block_scale_interleave_kernel(
     int numbatches, int numRows, int numCols, uint8_t const* SFIn, uint8_t* SFOutput);

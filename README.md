@@ -128,6 +128,9 @@ x = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
 # High-level API (auto-computes global_scale if not provided)
 fp4_packed, scale_factors = fp4_quantize(x)
 
+# Adaptive 4/6 block scaling (native CUDA, no fouroversix dependency)
+fp4_packed, scale_factors = fp4_quantize(x, scale_rule="mse")  # or "mae", "abs_max"
+
 # With fouroversix backend (optional dependency, adaptive block scaling)
 # qt = fp4_quantize(x, backend="fouroversix")  # returns QuantizedTensor
 
@@ -199,38 +202,14 @@ amax = triton_amax(x)
 ## Testing
 
 ```bash
-# FP4 quantize: correctness (vs PyTorch reference) + performance
-python tests/test_quantize.py
-python tests/test_quantize.py --shape 4096,4096 --dtype float16
-
-# NVFP4 GEMM: correctness (vs nn.Linear), with/without bias
-python tests/test_nvfp4_gemm.py
-python tests/test_nvfp4_gemm.py --backend cuda_core
-python tests/test_nvfp4_gemm.py --backend cutlass
-python tests/test_nvfp4_gemm.py --backend cutedsl  # requires nvidia-cutlass-dsl
-python tests/test_nvfp4_gemm.py --backend cublaslt
-python tests/test_nvfp4_gemm.py --backend auto --no-bias
-
-# NVFP4DynamicLinear: end-to-end correctness (vs nn.Linear)
-python tests/test_nvfp4_linear.py
-python tests/test_nvfp4_linear.py --gemm-backend cublaslt
-python tests/test_nvfp4_linear.py --quant-backend all   # includes fouroversix (if installed)
-python tests/test_nvfp4_linear.py --no-bias
-
-# Cross-validate with TensorRT-LLM (requires tensorrt_llm installed)
-python tests/test_quantize.py --compare-trtllm
-python tests/test_nvfp4_gemm.py --compare-trtllm  # placeholder, currently prints SKIP
-
-# fouroversix integration example (requires fouroversix, see tests/test_fouroversix/README.md)
-python tests/test_fouroversix/fouroversix_example.py
-python tests/test_fouroversix/fouroversix_example.py --shape 128,4096,4096 --scale-rules mse,static_6
-
-# Triton amax
-python tllm_linear_lite/amax/triton_amax.py
-
-# NCU profiling
-ncu --set full -o quantize_report python tests/test_quantize.py --ncu
+python tests/test_quantize.py                        # quantize correctness + perf
+python tests/test_quantize.py --scale-rule mse       # adaptive 4/6 standalone benchmark
+python tests/test_nvfp4_gemm.py                      # GEMM multi-backend correctness
+python tests/test_nvfp4_linear.py                    # NVFP4DynamicLinear e2e correctness
+ncu --set full -o report python tests/test_quantize.py --ncu  # NCU profiling
 ```
+
+See [`tests/README.md`](tests/README.md) for full CLI reference, benchmark output format, and sample results.
 
 ## What Changed from TensorRT-LLM
 
@@ -240,24 +219,9 @@ Derived from `tensorrt_llm/kernels/quantization.*`:
 - **Replaced** 8 TRT-LLM internal headers with a single `tllm_compat.cuh`
 - **Removed** non-FP4 code (INT8, per-token INT8/FP8, MXFP8)
 - **Kept** FP4 block quantization, block scale interleave, per-token global scale
+- **Optimized** v1 kernel: 16 elements/thread with 256-bit vectorized load (LDG.E.128×2), increased ILP to hide L1TEX scoreboard stalls
+- **Added** FourOverSix adaptive 4/6 kernel (`opt_quantize_with_block_size_adaptive`): per-block fake-quant at r=6 and r=4, picks lower error (MSE/MAE/ABS_MAX); streaming design, ~21 R32 peak registers
 - See comment blocks at top of each `.h` / `.cuh` / `.cu` file for detailed diff
-
-#### Kernel versions
-
-| Version | Kernel | Elements/thread | Load width | Status |
-|---------|--------|-----------------|------------|--------|
-| v0 | `quantize_with_block_size` | 8 | 128-bit (LDG.E.128×1) | ✅ ported |
-| v1 | `opt_quantize_with_block_size_v1` | 16 | 256-bit (LDG.E.128×2) | ✅ ported |
-
-**v1 优化说明**：v0 每 thread 处理 8 个元素（16B load），v1 将其翻倍至 16 个元素（32B load，通过两次连续 LDG.E.128 实现）。更多的 compute-per-load 使 scheduler 有更多独立指令可调度，从而隐藏 L1TEX scoreboard stall（约 7 cycles，占 CPI 的 40%）。v1 引入的新组件：
-- `CVT_OPT_ELTS_PER_THREAD = 16`（常量）
-- `PackedVec_Opt<T>`（32B 对齐的 32 字节向量类型）
-- `load_256bit()`（两次 128-bit inline asm load，保证生成 LDG.E.128）
-- `cvt_warp_fp16_to_fp4_impl_opt()`（16 元素内层实现，输出 `uint64_t`）
-- `opt_quantize_with_block_size_v1`（只支持 FP16/BF16→FP4，`__launch_bounds__(512, 4)`）
-- dispatch 侧新增 `kernelVersion` 参数（0=v0, 1=v1）
-
-> v1 只支持 FP16/BF16→FP4，FP8→FP4 和 FP16→MXFP8 仍使用 v0。
 
 ### GEMM kernels (`gemm/`)
 
@@ -285,10 +249,10 @@ See comment blocks at top of each file for detailed diff from TRT-LLM originals.
 - [x] Cute DSL NVFP4 GEMM -- Python-based Blackwell kernels (SM100/103, JIT compiled)
 - [x] cuBLASLt bias epilogue -- `nvfp4_gemm(..., bias=...)` uses fused epilogue on cublaslt backend
 - [x] Optional fouroversix wrapper -- `tllm_linear_lite.quantize.fp4_quantize(..., backend="fouroversix")`
-- [x] **Quantize kernel v1** -- 16 elements/thread, 32B vectorized load (LDG.E.128×2), 更多 ILP 以隐藏 L1TEX scoreboard stall；`invokeFP4Quantization` 新增 `kernelVersion` 参数（0=v0, 1=v1，默认 v1）；仅 FP16/BF16→FP4 路径
-- [ ] Bias epilogue fusion for non-cuBLASLt backends (cutlass/cuda_core/cutedsl)
-- [ ] FourOverSix adaptive block scaling in native CUDA quantize path
+- [x] **Quantize kernel v1** -- `opt_quantize_with_block_size_v1`: 16 elements/thread, 256-bit vectorized load (LDG.E.128×2), increased ILP to hide L1TEX scoreboard stalls (~7 cycles, ~40% of CPI); `invokeFP4Quantization` gains optional `kernelVersion` param (0=v0, 1=v1, default=1); FP16/BF16→FP4 path only
+- [x] **FourOverSix adaptive 4/6 in native CUDA** -- `fp4_quantize(x, scale_rule="mse"|"mae"|"abs_max")` runs streaming adaptive kernel (`opt_quantize_with_block_size_adaptive`) that fake-quants each block at r=6 and r=4, picks lower error; uses `encode_scale=1536/amax`; `scaleRule` param plumbed through C++ dispatch and PyTorch op
 - [x] End-to-end NVFP4 Linear -- `NVFP4DynamicLinear` fused quantize + GEMM `nn.Module` (tllm + fouroversix quant backends)
+- [ ] Bias epilogue fusion for non-cuBLASLt backends (cutlass/cuda_core/cutedsl)
 
 ## License
 
