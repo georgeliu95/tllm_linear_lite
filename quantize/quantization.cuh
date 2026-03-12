@@ -37,6 +37,13 @@
  *   - Note:    cvt_warp_fp16_to_mxfp8 is kept because quantize_with_block_size template
  *              references BlockScaleQuantizationType::FP16_TO_MXFP8; removing it would
  *              require modifying the kernel template structure.
+ *   - Added:   opt_quantize_with_block_size_v1 — optimized kernel (16 elems/thread,
+ *              256-bit vectorized load via LDG.E.128×2, better ILP)
+ *   - Added:   FourOverSix adaptive 4/6 block scaling:
+ *              AdaptiveScaleRule enum (NONE/MSE/MAE/ABS_MAX),
+ *              fake_quant_e2m1_8<Rule> (register-efficient fake-quant + error),
+ *              cvt_warp_fp16_to_fp4_adaptive (per-block r=6 vs r=4 selection),
+ *              opt_quantize_with_block_size_adaptive kernel (streaming, ~21 R32 peak)
  */
 
 #include "tllm_compat.cuh"

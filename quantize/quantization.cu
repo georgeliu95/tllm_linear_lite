@@ -35,6 +35,9 @@
  *   - Kept:    VecTypeImpl, VecType, getMaxAbs,
  *              computePerTokenGlobalScaleForFP4QuantizationKernel,
  *              computePerTokenGlobalScaleForFP4Quantization + instantiations (half/bf16)
+ *   - Added:   kernelVersion param to invokeFP4Quantization (0=v0, 1=v1 optimized)
+ *   - Added:   scaleRule param + adaptive 4/6 dispatch branch that launches
+ *              opt_quantize_with_block_size_adaptive<Rule> (MSE/MAE/ABS_MAX)
  */
 
 #include "tllm_compat.cuh"

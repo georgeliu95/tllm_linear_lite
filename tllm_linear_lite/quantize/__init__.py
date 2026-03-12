@@ -16,6 +16,8 @@
 tllm_linear_lite.quantize: FP4 quantization with optional fouroversix backend.
 
 - backend="tllm": uses torch.ops.tllm_linear_lite.fp4_quantize (native CUDA).
+  Supports scale_rule="static_6" (default NVFP4) or "mse"/"mae"/"abs_max"
+  for FourOverSix adaptive 4/6 block scaling (native CUDA, no fouroversix dependency).
 - backend="fouroversix": uses fouroversix.quantize_to_fp4 (optional dependency).
   When fouroversix is used, returns a fouroversix QuantizedTensor; use .dequantize()
   for high-precision values. When backend="tllm", returns (packed_fp4, scale_factors).

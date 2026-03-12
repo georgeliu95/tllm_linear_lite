@@ -18,11 +18,12 @@ test_quantize.py - tllm_linear_lite FP4 Quantization Test
 Goals:
 1. Correctness: Compare CUDA kernel output against a pure PyTorch NVFP4 reference
 2. Performance: Measure fp4_quantize kernel latency and memory bandwidth
-3. Cross-validation (optional): Bit-exact comparison with TensorRT-LLM's trtllm.fp4_quantize
-4. fouroversix (optional): If installed, report fouroversix quantize->dequant accuracy vs input
+3. Adaptive 4/6: Benchmark native CUDA adaptive kernel (MSE/MAE/ABS_MAX scale rules)
+4. Cross-validation (optional): Bit-exact comparison with TensorRT-LLM's trtllm.fp4_quantize
+5. fouroversix (optional): If installed, report fouroversix quantize->dequant accuracy vs input
 
 Usage:
-    # Basic test (correctness + performance)
+    # Basic test (correctness + performance, includes adaptive 4/6)
     python test_quantize.py
 
     # Custom shape and dtype
@@ -31,10 +32,13 @@ Usage:
     # Skip correctness, benchmark only
     python test_quantize.py --skip-verify
 
+    # Standalone adaptive 4/6 benchmark for a single scale rule
+    python test_quantize.py --scale-rule mse
+
     # Compare with TensorRT-LLM (requires tensorrt_llm installed)
     python test_quantize.py --compare-trtllm
 
-    # NCU profiling
+    # NCU profiling (includes adaptive kernels)
     ncu --set full -o quantize_report python test_quantize.py --ncu
 """
 

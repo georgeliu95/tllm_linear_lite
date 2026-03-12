@@ -26,6 +26,9 @@
  *   - Replaced FLOAT4_E2M1X2/SF_DTYPE with local constexpr
  *   - Replaced getMultiProcessorCount() with local implementation
  *   - No userbuffers support
+ *   - Added kernelVersion param (0=v0 original, 1=v1 optimized 16 elems/thread)
+ *   - Added scaleRule param (0=standard NVFP4, 1=MSE, 2=MAE, 3=ABS_MAX) for
+ *     FourOverSix adaptive 4/6 block scaling
  *   - Registered as torch.ops.tllm_linear_lite.{fp4_quantize, calculate_nvfp4_global_scale}
  */
 

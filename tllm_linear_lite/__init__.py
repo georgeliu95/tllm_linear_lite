@@ -16,7 +16,8 @@
 tllm_linear_lite: Standalone FP4 quantization ops.
 
 After building, the following PyTorch ops are available:
-    torch.ops.tllm_linear_lite.fp4_quantize(input, globalScale, sfVecSize, sfUseUE8M0, isSfSwizzledLayout)
+    torch.ops.tllm_linear_lite.fp4_quantize(input, globalScale, sfVecSize,
+        sfUseUE8M0=False, isSfSwizzledLayout=True, kernelVersion=1, scaleRule=0)
     torch.ops.tllm_linear_lite.calculate_nvfp4_global_scale(input, tokensPerBatch)
 """
 

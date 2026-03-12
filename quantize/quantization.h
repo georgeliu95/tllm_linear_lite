@@ -31,6 +31,8 @@
  *   - Kept:    computePerTokenGlobalScaleForFP4Quantization<T>() (per-token global scale for NVFP4)
  *   - Kept:    QuantizationSFLayout, BlockScaleQuantizationType, PadUpFn,
  *              computeSwizzledLayoutSFSize, computeLinearLayoutSFSize
+ *   - Added:   invokeFP4Quantization params: kernelVersion (0=v0, 1=v1), scaleRule (0=standard,
+ *              1=MSE, 2=MAE, 3=ABS_MAX for adaptive 4/6)
  */
 
  #pragma once
