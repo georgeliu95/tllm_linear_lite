@@ -937,59 +937,81 @@ enum class AdaptiveScaleRule { NONE = 0, MSE = 1, MAE = 2, ABS_MAX = 3 };
  * discarded — keeping register pressure minimal.
  *
  * Returns the packed E2M1 output (uint32_t = 8 nibbles).
+ *
+ * Processes 8 elements (4 half2) rather than the full 16-element block to cap
+ * register pressure. The caller invokes this twice (lo + hi halves) so the
+ * second call reuses the same physical regs after the first's die.
+ * PTX `mov.b32 {b0,b1,b2,b3}` naturally packs 4 bytes = 8 nibbles = 1 uint32.
+ *
+ * Quantization uses the f16x2/bf16x2 → e2m1x2 path (PTX ISA 9.1, CUDA 13.1+):
+ * scale multiplication stays in half precision (HMUL2, 1 inst per pair) and
+ * cvt.rn.satfinite.e2m1x2.f16x2 takes the half2 directly — avoiding the
+ * half→float conversion + f32 scale multiply of the original f32 path.
+ * Trade-off: fp16 scale has 10-bit mantissa vs fp32's 23-bit; acceptable for
+ * the adaptive error-comparison use case (both candidates lose similar precision).
+ * Requires: CUDA 13.1+ (PTX ISA 9.1). CUDA 13.0 ptxas will reject this.
  */
 template <AdaptiveScaleRule Rule, class HalfType>
 __device__ __forceinline__ uint32_t fake_quant_e2m1_8(
     HalfType const (&h2)[4], float outputScale, float decodeScale, float& err)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    // Convert half2 → float pair-by-pair, scale, and feed to PTX.
-    // Each float pair is a temporary — only 2 floats live at a time.
-    float s0, s1, s2, s3, s4, s5, s6, s7;
+    // --- Quant: scale in half precision + f16x2/bf16x2 → e2m1x2 (PTX ISA 9.1) ---
+    // 4 × HMUL2 + 4 × cvt.e2m1x2.f16x2 = 8 instructions
+    // (was: 4 × F2FP + 8 × FMUL + 4 × cvt.e2m1x2.f32 = 16 instructions)
+    uint32_t e2m1_packed;
     {
-        float2 f;
+        HalfType scale_vec;
         if constexpr (std::is_same_v<HalfType, __half2>)
-            f = __half22float2(h2[0]);
+            scale_vec = __float2half2_rn(outputScale);
         else
-            f = __bfloat1622float2(h2[0]);
-        s0 = f.x * outputScale; s1 = f.y * outputScale;
+            scale_vec = __float2bfloat162_rn(outputScale);
+
+        HalfType sq0 = __hmul2(h2[0], scale_vec);
+        HalfType sq1 = __hmul2(h2[1], scale_vec);
+        HalfType sq2 = __hmul2(h2[2], scale_vec);
+        HalfType sq3 = __hmul2(h2[3], scale_vec);
+
+        uint32_t u0 = reinterpret_cast<uint32_t&>(sq0);
+        uint32_t u1 = reinterpret_cast<uint32_t&>(sq1);
+        uint32_t u2 = reinterpret_cast<uint32_t&>(sq2);
+        uint32_t u3 = reinterpret_cast<uint32_t&>(sq3);
 
         if constexpr (std::is_same_v<HalfType, __half2>)
-            f = __half22float2(h2[1]);
+        {
+            asm(
+                "{\n"
+                ".reg .b8 byte0, byte1, byte2, byte3;\n"
+                "cvt.rn.satfinite.e2m1x2.f16x2 byte0, %1;\n"
+                "cvt.rn.satfinite.e2m1x2.f16x2 byte1, %2;\n"
+                "cvt.rn.satfinite.e2m1x2.f16x2 byte2, %3;\n"
+                "cvt.rn.satfinite.e2m1x2.f16x2 byte3, %4;\n"
+                "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+                "}"
+                : "=r"(e2m1_packed)
+                : "r"(u0), "r"(u1), "r"(u2), "r"(u3)
+            );
+        }
         else
-            f = __bfloat1622float2(h2[1]);
-        s2 = f.x * outputScale; s3 = f.y * outputScale;
-
-        if constexpr (std::is_same_v<HalfType, __half2>)
-            f = __half22float2(h2[2]);
-        else
-            f = __bfloat1622float2(h2[2]);
-        s4 = f.x * outputScale; s5 = f.y * outputScale;
-
-        if constexpr (std::is_same_v<HalfType, __half2>)
-            f = __half22float2(h2[3]);
-        else
-            f = __bfloat1622float2(h2[3]);
-        s6 = f.x * outputScale; s7 = f.y * outputScale;
+        {
+            asm(
+                "{\n"
+                ".reg .b8 byte0, byte1, byte2, byte3;\n"
+                "cvt.rn.satfinite.e2m1x2.bf16x2 byte0, %1;\n"
+                "cvt.rn.satfinite.e2m1x2.bf16x2 byte1, %2;\n"
+                "cvt.rn.satfinite.e2m1x2.bf16x2 byte2, %3;\n"
+                "cvt.rn.satfinite.e2m1x2.bf16x2 byte3, %4;\n"
+                "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+                "}"
+                : "=r"(e2m1_packed)
+                : "r"(u0), "r"(u1), "r"(u2), "r"(u3)
+            );
+        }
     }
 
-    // Quantize 8 floats → 4 E2M1 byte pairs, packed into uint32.
-    uint32_t e2m1_packed;
-    asm(
-        "{\n"
-        ".reg .b8 byte0, byte1, byte2, byte3;\n"
-        "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"
-        "cvt.rn.satfinite.e2m1x2.f32 byte1, %4, %3;\n"
-        "cvt.rn.satfinite.e2m1x2.f32 byte2, %6, %5;\n"
-        "cvt.rn.satfinite.e2m1x2.f32 byte3, %8, %7;\n"
-        "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
-        "}"
-        : "=r"(e2m1_packed)
-        : "f"(s0), "f"(s1), "f"(s2), "f"(s3), "f"(s4), "f"(s5), "f"(s6), "f"(s7)
-    );
-
-    // Dequant + error: per-pair asm blocks allow compiler to interleave
-    // error computation between dequant results.
+    // Per-byte dequant: each DEQUANT_BYTE extracts one .b8 from e2m1_packed and
+    // converts back to f16x2. Separate asm blocks (non-volatile) so the compiler
+    // can interleave dequant with error computation if profitable.
 #define DEQUANT_BYTE(IDX, BSEL)                                       \
     uint32_t dq##IDX;                                                  \
     asm(                                                               \
@@ -1082,13 +1104,17 @@ __device__ uint64_t cvt_warp_fp16_to_fp4_adaptive(VecType& vec, float SFScaleVal
 
     float rcp_SFScale = reciprocal_approximate_ftz(SFScaleVal);
 
-    // Zero-copy references to vec.elts lower/upper halves — no register copies.
+    // Zero-copy references: reinterpret vec.elts[0..3] and vec.elts[4..7] as
+    // const-ref arrays without copying values into separate registers.
+    // Saves ~8 regs vs naive `lo_6[4] = {vec.elts[0], ...}` value copy.
     using HalfVecT = typename TypeConverter<Type>::Type;
     using Arr4Ref = HalfVecT const (&)[4];
     Arr4Ref lo = reinterpret_cast<Arr4Ref>(vec.elts[0]);
     Arr4Ref hi = reinterpret_cast<Arr4Ref>(vec.elts[4]);
 
     // --- Step 3+4: r=6 fake-quant + error (stored as initial winner) ---
+    // Scoped block: sf_f / outputScale / decodeScale die at '}', freeing ~3 regs
+    // before r=4 scope allocates its own set — prevents both sets coexisting.
     float best_err = 0.0f;
     uint32_t e2m1_lo, e2m1_hi;
     __nv_fp8_e4m3 sf_best = sf_6_e4m3;
@@ -1096,11 +1122,17 @@ __device__ uint64_t cvt_warp_fp16_to_fp4_adaptive(VecType& vec, float SFScaleVal
         float sf_f = static_cast<float>(sf_6_e4m3);
         float decodeScale = sf_f * rcp_SFScale;
         float outputScale = vecMax != 0 ? reciprocal_approximate_ftz(decodeScale) : 0.0f;
+        // Process 16 elements as two batches of 8 to keep register pressure low.
+        // fake_quant_e2m1_8 peaks at 8 regs (s0-s7 scaled floats for quant asm input);
+        // a hypothetical 16-at-once would need 16 simultaneous regs, blowing the budget.
+        // The second call reuses the same physical regs after the first call's s0-s7 die.
+        // best_err accumulates across both calls (passed by reference).
         e2m1_lo = fake_quant_e2m1_8<Rule>(lo, outputScale, decodeScale, best_err);
         e2m1_hi = fake_quant_e2m1_8<Rule>(hi, outputScale, decodeScale, best_err);
     }
 
     // --- Step 5: r=4 fake-quant + error ---
+    // Scoped block reuses the same ~3 reg slots freed from r=6 scope above.
     float err_4 = 0.0f;
     uint32_t e2m1_4_lo, e2m1_4_hi;
     {
@@ -1127,6 +1159,8 @@ __device__ uint64_t cvt_warp_fp16_to_fp4_adaptive(VecType& vec, float SFScaleVal
     }
 
     // --- Step 7: Overwrite with r=4 if it produces lower error ---
+    // Serialized winner selection: r=6 result already in e2m1_lo/hi, conditionally
+    // overwrite with r=4. Avoids keeping separate winner_lo/hi/sf variables.
     if (err_4 < best_err)
     {
         e2m1_lo = e2m1_4_lo;
@@ -1161,6 +1195,11 @@ __device__ uint64_t cvt_warp_fp16_to_fp4_adaptive(VecType& vec, float SFScaleVal
 template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, AdaptiveScaleRule Rule>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    // (512, 3): register budget = 65536 / (512*3) = 42 regs/thread.
+    // Adaptive kernel compiles to ~40 regs — fits within budget with no spill.
+    // (512, 4) would force 32-reg budget → spill to local memory (L2 traffic 4.5x).
+    // (512, 2) eliminates spill but compiler inflates to 63 regs → occupancy 33%.
+    // (512, 3) at 40 regs → 4 blocks/SM → 56% occupancy — best trade-off.
     __launch_bounds__(512, 3) opt_quantize_with_block_size_adaptive(
 #else
 opt_quantize_with_block_size_adaptive(

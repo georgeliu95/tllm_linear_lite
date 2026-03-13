@@ -89,7 +89,7 @@ tllm_linear_lite/
 
 - Python >= 3.10
 - PyTorch >= 2.4 (with CUDA support)
-- CUDA Toolkit 12.x+
+- CUDA Toolkit 12.x+ (adaptive quantize kernel requires **CUDA 13.1+** for `cvt.rn.satfinite.e2m1x2.f16x2` PTX ISA 9.1 instruction)
 - GPU: Blackwell (sm_100a) required for FP4 E2M1 PTX instructions
 
 ## Installation
@@ -220,7 +220,7 @@ Derived from `tensorrt_llm/kernels/quantization.*`:
 - **Removed** non-FP4 code (INT8, per-token INT8/FP8, MXFP8)
 - **Kept** FP4 block quantization, block scale interleave, per-token global scale
 - **Optimized** v1 kernel: 16 elements/thread with 256-bit vectorized load (LDG.E.128×2), increased ILP to hide L1TEX scoreboard stalls
-- **Added** FourOverSix adaptive 4/6 kernel (`opt_quantize_with_block_size_adaptive`): per-block fake-quant at r=6 and r=4, picks lower error (MSE/MAE/ABS_MAX); streaming design, ~21 R32 peak registers
+- **Added** FourOverSix adaptive 4/6 kernel (`opt_quantize_with_block_size_adaptive`): per-block fake-quant at r=6 and r=4, picks lower error (MSE/MAE/ABS_MAX); streaming design, ~40 R32 registers (launch_bounds 512×3)
 - See comment blocks at top of each `.h` / `.cuh` / `.cu` file for detailed diff
 
 ### GEMM kernels (`gemm/`)
