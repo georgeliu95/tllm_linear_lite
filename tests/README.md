@@ -108,7 +108,7 @@ Sample output (B200, `(14400, 6144)`, bf16):
   Speedup vs tllm              1.00x        0.80x        0.84x        0.81x        0.27x        0.48x        0.28x        0.48x
 ```
 
-- **Prologue**: `triton_amax` → global scale (tllm); `quantize_fp4_prologue` (fouroversix)
+- **Prologue**: `triton_amax` → global scale (tllm); `quantize_fp4_prologue` (fouroversix — includes buffer allocation + zeroing + prologue kernel)
 - **Quant**: `fp4_quantize` kernel (tllm); `quantize_fp4_main` (fouroversix)
 - **Total**: Prologue + Quant
 - **BW**: `(input_bytes + output_bytes) / total_time`
@@ -229,7 +229,7 @@ configs. Sample output (B200, bf16, gemm=cublaslt):
   Speedup vs tllm              1.00x         0.92x         0.93x         0.92x         0.49x         0.49x         0.71x
 ```
 
-- **Prologue**: `triton_amax` → global scale (tllm); `quantize_fp4_prologue` (fouroversix)
+- **Prologue**: `triton_amax` → global scale (tllm); `quantize_fp4_prologue` (fouroversix — includes buffer allocation + zeroing + prologue kernel)
 - **Quant**: `fp4_quantize` kernel (tllm); `quantize_fp4_main` (fouroversix)
 - **GEMM**: `nvfp4_gemm` (same backend for all configs within a shape)
 
