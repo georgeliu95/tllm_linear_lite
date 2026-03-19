@@ -38,12 +38,20 @@ pip install -e .
 
 ### What the Patch Does
 
-The included `fouroversix.patch` modifies
-`src/fouroversix/quantize/quantized_tensor.py` with two changes:
+The included `fouroversix.patch` modifies several files:
 
+**`quantized_tensor.py`** (convenience API):
 1. `from __future__ import annotations` — enables PEP 604 union syntax (`X | Y`)
-2. `QuantizedTensor.to()` method — convenience API for dtype conversion (dequantize)
-   and device transfer
+2. `QuantizedTensor.to()` method — dtype conversion (dequantize) and device transfer
+
+**Split quantize op** (profiling support — splits the single `quantize_to_fp4` op
+into two independently measurable PyTorch ops, with zero kernel change):
+3. `fp4_quant.h` — adds `phase` field to `FP4_quant_params` (0=both, 1=prologue, 2=quant)
+4. `fp4_quant_launch_template.h` — conditional launch based on `phase`
+5. `fp4_quant.cu` — refactors host code, adds `quantize_fp4_prologue` and `quantize_fp4_main`
+6. `bindings.cpp` — registers the two new op schemas
+7. `cuda/ops.py` — Python wrappers + `register_fake` for split ops
+8. `cuda/backend.py` — `CUDAQuantizeBackend.quantize_fp4_prologue/main` classmethods
 
 ## Usage
 

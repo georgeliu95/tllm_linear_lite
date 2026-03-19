@@ -44,23 +44,13 @@ import torch.nn as nn
 from tllm_linear_lite.quantize import (
     FOUROVERSIX_AVAILABLE,
     fp4_quantize,
+    _SCALE_RULE_MAP,
+    _TLLM_QUANT_RANGE,
+    _FOUROVERSIX_QUANT_RANGE,
 )
+from tllm_linear_lite.amax import triton_amax
 from tllm_linear_lite.nvfp4_gemm import nvfp4_gemm, _is_blackwell_sm
 from tllm_linear_lite.cutedsl import IS_CUTLASS_DSL_AVAILABLE
-
-# ---------------------------------------------------------------------------
-# NVFP4 numeric constants
-#
-# Quant range (QR) = max_e2m1_value * max_e4m3_value.  The max_e4m3 value
-# depends on the quantization scheme:
-#   - tllm / fouroversix static_6 / static_4:  max_e4m3 = 448 (full E4M3)
-#   - fouroversix mse / abs_max / mae (4o6):   max_e4m3 = 256 (reduced for
-#     mixed block scaling — the upper range is reserved for encoding which
-#     blocks use max_e2m1=4 vs 6)
-# ---------------------------------------------------------------------------
-FP8_E4M3_MAX: float = 448.0
-NVFP4_E2M1_MAX: float = 6.0
-TLLM_QUANT_RANGE: float = NVFP4_E2M1_MAX * FP8_E4M3_MAX  # 2688.0
 
 # torch.finfo(torch.float32).tiny ≈ 1.175e-38 is too small: dividing
 # quant_range (2688) by it overflows float32 (max ~3.4e38), producing inf
@@ -74,18 +64,24 @@ _VALID_GEMM_BACKENDS = ("auto", "cutedsl", "cutlass", "cublaslt")
 _VALID_QUANT_BACKENDS = ("tllm", "fouroversix")
 
 
-def _compute_quant_range(quant_backend: str, quant_config: object | None) -> float:
+def _compute_quant_range(
+    quant_backend: str,
+    quant_config: object | None,
+    scale_rule: str = "static_6",
+) -> float:
     """Derive quant range (max_e2m1 * max_e4m3) from quant configuration.
 
-    For tllm backend the range is always 6 * 448 = 2688.  For fouroversix the
-    range depends on the scale rule: static rules use full E4M3 range (448),
-    while mixed 4/6 rules (mse, abs_max, mae) use a reduced range (256).
+    For tllm backend the range depends on the scale rule: static rules use
+    the full E4M3 range (6 * 448 = 2688), while adaptive 4/6 rules (mse,
+    abs_max, mae) use a reduced range (6 * 256 = 1536).  For fouroversix the
+    range is derived from the QuantizationConfig.
 
     Args:
         quant_backend: ``"tllm"`` or ``"fouroversix"``.
         quant_config: A resolved ``fouroversix.QuantizationConfig``.
                       Must not be ``None`` when ``quant_backend="fouroversix"``
                       (caller is responsible for creating the default config).
+        scale_rule: Block scale selection rule (tllm backend only).
 
     Returns:
         Quant range as a Python float.
@@ -95,7 +91,8 @@ def _compute_quant_range(quant_backend: str, quant_config: object | None) -> flo
                     is None (indicates a caller bug).
     """
     if quant_backend == "tllm":
-        return TLLM_QUANT_RANGE
+        is_adaptive = _SCALE_RULE_MAP.get(scale_rule, 0) != 0
+        return _FOUROVERSIX_QUANT_RANGE if is_adaptive else _TLLM_QUANT_RANGE
 
     if quant_config is None:
         raise ValueError(
@@ -128,6 +125,10 @@ class NVFP4DynamicLinear(nn.Module):
                       ``"cutedsl"`` force a specific backend.
         quant_backend: ``"tllm"`` (native CUDA) or ``"fouroversix"``
                        (optional dependency, MSE-based adaptive scaling).
+        scale_rule:   Block scale selection rule (tllm backend only).
+                      ``"static_6"`` (default) — standard NVFP4.
+                      ``"mse"`` / ``"mae"`` / ``"abs_max"`` — adaptive 4/6.
+                      Ignored when ``quant_backend="fouroversix"``.
         quant_config:  ``fouroversix.QuantizationConfig`` for the fouroversix
                        backend.  Ignored when ``quant_backend="tllm"``.
                        ``None`` defaults to ``QuantizationConfig()`` (MSE).
@@ -149,6 +150,7 @@ class NVFP4DynamicLinear(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
         gemm_backend: str = "auto",
         quant_backend: str = "tllm",
+        scale_rule: str = "static_6",
         quant_config: object | None = None,
     ) -> None:
         super().__init__()
@@ -163,6 +165,11 @@ class NVFP4DynamicLinear(nn.Module):
                 f"quant_backend must be one of {_VALID_QUANT_BACKENDS}, "
                 f"got '{quant_backend}'"
             )
+        if quant_backend == "tllm" and scale_rule not in _SCALE_RULE_MAP:
+            raise ValueError(
+                f"scale_rule must be one of {list(_SCALE_RULE_MAP.keys())}, "
+                f"got '{scale_rule}'"
+            )
         if quant_backend == "fouroversix" and not FOUROVERSIX_AVAILABLE:
             raise ImportError(
                 "fouroversix is not installed. "
@@ -174,6 +181,7 @@ class NVFP4DynamicLinear(nn.Module):
         self.dtype = dtype
         self.gemm_backend = gemm_backend
         self.quant_backend = quant_backend
+        self.scale_rule = scale_rule
 
         # Resolve fouroversix config BEFORE computing quant_range, since QR
         # depends on the scale_rule (e.g. MSE uses max_e4m3=256, not 448).
@@ -182,7 +190,9 @@ class NVFP4DynamicLinear(nn.Module):
             quant_config = _QC()
 
         self.quant_config = quant_config
-        self.quant_range = _compute_quant_range(quant_backend, quant_config)
+        self.quant_range = _compute_quant_range(
+            quant_backend, quant_config, scale_rule
+        )
 
         # Weight buffers — correct shapes for strict load_state_dict
         self.register_buffer(
@@ -216,6 +226,7 @@ class NVFP4DynamicLinear(nn.Module):
         linear: nn.Linear,
         gemm_backend: str = "auto",
         quant_backend: str = "tllm",
+        scale_rule: str = "static_6",
         quant_config: object | None = None,
     ) -> "NVFP4DynamicLinear":
         """Create an ``NVFP4DynamicLinear`` from a pretrained ``nn.Linear``.
@@ -227,6 +238,7 @@ class NVFP4DynamicLinear(nn.Module):
             linear:       Source ``nn.Linear`` (must be on CUDA).
             gemm_backend: See class docstring.
             quant_backend: See class docstring.
+            scale_rule:   See class docstring.
             quant_config:  See class docstring.
 
         Returns:
@@ -239,6 +251,7 @@ class NVFP4DynamicLinear(nn.Module):
             dtype=linear.weight.dtype,
             gemm_backend=gemm_backend,
             quant_backend=quant_backend,
+            scale_rule=scale_rule,
             quant_config=quant_config,
         )
         device = linear.weight.device
@@ -262,6 +275,7 @@ class NVFP4DynamicLinear(nn.Module):
             global_scale = self.quant_range / weight_amax
             fp4, sf = fp4_quantize(
                 weight, global_scale=global_scale, swizzled=True,
+                scale_rule=self.scale_rule,
             )
         else:
             from fouroversix import quantize_to_fp4 as _fox_quantize
@@ -350,10 +364,11 @@ class NVFP4DynamicLinear(nn.Module):
             tensor on the same device.
         """
         if self.quant_backend == "tllm":
-            act_amax = x.abs().amax().float().clamp_min(_EPS)
+            act_amax = triton_amax(x).float().clamp_min(_EPS)
             act_gs = self.quant_range / act_amax
             act_fp4, act_sf = fp4_quantize(
                 x, global_scale=act_gs, swizzled=True,
+                scale_rule=self.scale_rule,
             )
             return act_fp4, act_sf, act_amax
 
@@ -437,4 +452,6 @@ class NVFP4DynamicLinear(nn.Module):
             f"gemm_backend='{self.gemm_backend}'",
             f"quant_range={self.quant_range}",
         ]
+        if self.quant_backend == "tllm" and self.scale_rule != "static_6":
+            parts.append(f"scale_rule='{self.scale_rule}'")
         return ", ".join(parts)

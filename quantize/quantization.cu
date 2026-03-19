@@ -90,15 +90,15 @@ namespace kernels
          config.numAttrs = 1;
          config.attrs = attrs;
 
-         if (scaleRule != 0)
-         {
-             // Adaptive 4/6: streaming kernel, always 16 elems/thread.
-             // Caller passes globalScale = 1536/amax (not 2688/amax).
-             dim3 block(std::min(int(n / CVT_OPT_ELTS_PER_THREAD), 512));
-             int const numBlocksPerSM = std::max(1u, 2048u / block.x);
-             dim3 grid(std::min(numBlocksForM, multiProcessorCount * numBlocksPerSM));
-             config.gridDim = grid;
-             config.blockDim = block;
+        if (scaleRule != 0)
+        {
+            // Adaptive v1-based: 16 elems/thread, 1D grid, batch f16x2 (方案 E).
+            // Same grid/block as v1 (16 elts/thread → numCols/16 threads).
+            dim3 block(std::min(int(n / CVT_OPT_ELTS_PER_THREAD), 512));
+            int const numBlocksPerSM = std::max(1u, 2048u / block.x);
+            dim3 grid(std::min(numBlocksForM, multiProcessorCount * numBlocksPerSM));
+            config.gridDim = grid;
+            config.blockDim = block;
 
 #define LAUNCH_ADAPTIVE_KERNEL(RULE)                                                                              \
     do {                                                                                                          \

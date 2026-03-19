@@ -174,9 +174,12 @@ nvfp4 = NVFP4DynamicLinear.from_linear(linear)
 x = torch.randn(2, 128, 4096, device="cuda", dtype=torch.bfloat16)
 output = nvfp4(x)  # [2, 128, 4096]
 
+# With adaptive 4/6 block scaling (tllm backend, native CUDA)
+nvfp4_mse = NVFP4DynamicLinear.from_linear(linear, scale_rule="mse")
+
 # With fouroversix quantization backend (optional dependency)
 # from fouroversix import QuantizationConfig
-# nvfp4_fox = NVFP4DynamicLinear.from_linear(
+# nvfp4_f46 = NVFP4DynamicLinear.from_linear(
 #     linear, quant_backend="fouroversix",
 #     quant_config=QuantizationConfig(scale_rule="mse"),
 # )

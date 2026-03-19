@@ -1,3 +1,673 @@
+diff --git a/src/fouroversix/csrc/bindings.cpp b/src/fouroversix/csrc/bindings.cpp
+index 4e3cdeb..160e931 100644
+--- a/src/fouroversix/csrc/bindings.cpp
++++ b/src/fouroversix/csrc/bindings.cpp
+@@ -26,6 +26,8 @@ namespace fouroversix
+     TORCH_LIBRARY(fouroversix, m)
+     {
+         m.def("quantize_to_fp4(Tensor x, bool is_nvfp4, bool is_rtn, bool is_rht, bool is_2d, bool is_transpose, int selection_rule, int rbits) -> (Tensor, Tensor, Tensor)");
++        m.def("quantize_fp4_prologue(Tensor x, bool is_nvfp4, bool is_rtn, bool is_rht, bool is_2d, bool is_transpose, int selection_rule, int rbits) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
++        m.def("quantize_fp4_main(Tensor x, Tensor x_e2m1, Tensor x_sf, Tensor x_sft, Tensor x_rht, Tensor amax, bool is_nvfp4, bool is_rtn, bool is_rht, bool is_2d, bool is_transpose, int selection_rule, int rbits) -> (Tensor, Tensor, Tensor)");
+         m.def("gemm_mxfp4mxfp4_accum_fp32_out_bf16_tnt(Tensor A, Tensor B, Tensor A_sf, Tensor B_sf, Tensor alpha) -> Tensor");
+         m.def("gemm_mxfp4mxfp4_accum_fp32_out_bf16_tnt_sm120(Tensor A, Tensor B, Tensor A_sf, Tensor B_sf, Tensor alpha) -> Tensor");
+         m.def("gemm_nvfp4nvfp4_accum_fp32_out_bf16_tnt(Tensor A, Tensor B, Tensor A_sf, Tensor B_sf, Tensor alpha) -> Tensor");
+diff --git a/src/fouroversix/csrc/include/fp4_quant.h b/src/fouroversix/csrc/include/fp4_quant.h
+index b4b5145..3b0fdef 100644
+--- a/src/fouroversix/csrc/include/fp4_quant.h
++++ b/src/fouroversix/csrc/include/fp4_quant.h
+@@ -49,6 +49,7 @@ namespace fouroversix
+         bool is_transpose;
+         int selection_rule; // 0: static_6, 1: static_4, 2: 4o6_mae, 3: 4o6_mse
+         int rbits;
++        int phase = 0; // 0: both (default), 1: prologue only, 2: quant only
+     };
+ 
+     template <typename T, bool Is_nvfp4, bool Is_rht, bool Is_transpose>
+diff --git a/src/fouroversix/csrc/include/fp4_quant_launch_template.h b/src/fouroversix/csrc/include/fp4_quant_launch_template.h
+index 4168b3e..fd0f85a 100644
+--- a/src/fouroversix/csrc/include/fp4_quant_launch_template.h
++++ b/src/fouroversix/csrc/include/fp4_quant_launch_template.h
+@@ -113,8 +113,10 @@ namespace fouroversix
+     {
+         constexpr bool Is_nvfp4 = false;
+         constexpr bool Is_rht = false;
+-        launch_fp4_quant_prologue<FP4_quant_kernel_traits<128, 128, 4, Is_nvfp4, Is_transpose, T>, Is_nvfp4, Is_rht, Is_transpose>(params, stream);
+-        launch_fp4_quant<FP4_quant_kernel_traits<128, 128, 4, Is_nvfp4, Is_transpose, T>, Is_nvfp4, Is_rht, Is_transpose>(params, stream);
++        if (params.phase != 2)
++            launch_fp4_quant_prologue<FP4_quant_kernel_traits<128, 128, 4, Is_nvfp4, Is_transpose, T>, Is_nvfp4, Is_rht, Is_transpose>(params, stream);
++        if (params.phase != 1)
++            launch_fp4_quant<FP4_quant_kernel_traits<128, 128, 4, Is_nvfp4, Is_transpose, T>, Is_nvfp4, Is_rht, Is_transpose>(params, stream);
+     }
+ 
+     template <typename T, bool Is_transpose>
+@@ -122,8 +124,10 @@ namespace fouroversix
+     {
+         constexpr bool Is_nvfp4 = false;
+         constexpr bool Is_rht = true;
+-        launch_fp4_quant_prologue<FP4_quant_kernel_traits<128, 128, 4, Is_nvfp4, Is_transpose, T>, Is_nvfp4, Is_rht, Is_transpose>(params, stream);
+-        launch_fp4_quant<FP4_quant_kernel_traits<128, 128, 4, Is_nvfp4, Is_transpose, T>, Is_nvfp4, Is_rht, Is_transpose>(params, stream);
++        if (params.phase != 2)
++            launch_fp4_quant_prologue<FP4_quant_kernel_traits<128, 128, 4, Is_nvfp4, Is_transpose, T>, Is_nvfp4, Is_rht, Is_transpose>(params, stream);
++        if (params.phase != 1)
++            launch_fp4_quant<FP4_quant_kernel_traits<128, 128, 4, Is_nvfp4, Is_transpose, T>, Is_nvfp4, Is_rht, Is_transpose>(params, stream);
+     }
+ 
+     template <typename T, bool Is_transpose>
+@@ -131,8 +135,10 @@ namespace fouroversix
+     {
+         constexpr bool Is_nvfp4 = true;
+         constexpr bool Is_rht = false;
+-        launch_fp4_quant_prologue<FP4_quant_kernel_traits<128, 64, 4, Is_nvfp4, Is_transpose, T>, Is_nvfp4, Is_rht, Is_transpose>(params, stream);
+-        launch_fp4_quant<FP4_quant_kernel_traits<128, 64, 4, Is_nvfp4, Is_transpose, T>, Is_nvfp4, Is_rht, Is_transpose>(params, stream);
++        if (params.phase != 2)
++            launch_fp4_quant_prologue<FP4_quant_kernel_traits<128, 64, 4, Is_nvfp4, Is_transpose, T>, Is_nvfp4, Is_rht, Is_transpose>(params, stream);
++        if (params.phase != 1)
++            launch_fp4_quant<FP4_quant_kernel_traits<128, 64, 4, Is_nvfp4, Is_transpose, T>, Is_nvfp4, Is_rht, Is_transpose>(params, stream);
+     }
+ 
+     template <typename T, bool Is_transpose>
+@@ -140,8 +146,10 @@ namespace fouroversix
+     {
+         constexpr bool Is_nvfp4 = true;
+         constexpr bool Is_rht = true;
+-        launch_fp4_quant_prologue<FP4_quant_kernel_traits<128, 64, 4, Is_nvfp4, Is_transpose, T>, Is_nvfp4, Is_rht, Is_transpose>(params, stream);
+-        launch_fp4_quant<FP4_quant_kernel_traits<128, 64, 4, Is_nvfp4, Is_transpose, T>, Is_nvfp4, Is_rht, Is_transpose>(params, stream);
++        if (params.phase != 2)
++            launch_fp4_quant_prologue<FP4_quant_kernel_traits<128, 64, 4, Is_nvfp4, Is_transpose, T>, Is_nvfp4, Is_rht, Is_transpose>(params, stream);
++        if (params.phase != 1)
++            launch_fp4_quant<FP4_quant_kernel_traits<128, 64, 4, Is_nvfp4, Is_transpose, T>, Is_nvfp4, Is_rht, Is_transpose>(params, stream);
+     }
+ 
+ } // namespace fouroversix
+diff --git a/src/fouroversix/csrc/quantize/fp4_quant.cu b/src/fouroversix/csrc/quantize/fp4_quant.cu
+index 2eb1682..a6f3358 100644
+--- a/src/fouroversix/csrc/quantize/fp4_quant.cu
++++ b/src/fouroversix/csrc/quantize/fp4_quant.cu
+@@ -96,143 +96,237 @@ namespace fouroversix
+                                                               { run_fp4_quant_<fp16_type, Is_nvfp4, Is_rht, Is_transpose>(params, stream); }); }); }); });
+     }
+ 
+-    std::tuple<at::Tensor, at::Tensor, at::Tensor> quantize_to_fp4(
+-        const at::Tensor &x,
+-        const bool is_nvfp4,
+-        const bool is_rtn,
+-        const bool is_rht,
+-        // const bool       is_4o6,
+-        const bool is_2d,
+-        const bool is_transpose,
+-        const int64_t selection_rule,
+-        const int64_t rbits)
++    /**************************************************************************
++     * Helper: common validation, dimension derivation, and buffer allocation
++     **************************************************************************/
++
++    struct QuantizeBuffers
+     {
++        at::Tensor x_rht, x_e2m1, x_sf, x_sft, amax;
++        int M, N, M_rounded, N_rounded, M_sf, N_sf;
++    };
+ 
+-        /*******
+-         * selection_rule:
+-         * 0: static_6
+-         * 1: static_4
+-         * 2: 4o6_l1_norm
+-         * 3: 4o6_mse
+-         * 4: 4o6_abs_max
+-         */
+-        TORCH_CHECK(selection_rule >= 0 && selection_rule <= 4, "Invalid selection_rule: " + std::to_string(selection_rule));
+-        // const int is_4o6 = selection_rule == 2 || selection_rule == 3;
+-
+-        /**********************
+-         * 1. Sanity checks   *
+-         *********************/
+-        at::cuda::CUDAGuard device_guard{x.device()};
++    static void validate_input(
++        const at::Tensor &x,
++        const int64_t selection_rule)
++    {
++        TORCH_CHECK(selection_rule >= 0 && selection_rule <= 4,
++                    "Invalid selection_rule: " + std::to_string(selection_rule));
+ 
+-        // Hardware capability
+-        {
+-            auto [cc_major, _] = get_compute_capability(get_current_device());
+-            TORCH_CHECK(cc_major >= 10, "FP4Quant only supports Blackwell GPUs or newer.");
+-        }
++        auto [cc_major, _] = get_compute_capability(get_current_device());
++        TORCH_CHECK(cc_major >= 10, "FP4Quant only supports Blackwell GPUs or newer.");
+ 
+-        // Dtype / device checks
+         auto dtype = x.dtype();
+         TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
+                     "FP4Quant only supports fp16 and bf16 data types");
+-        // TORCH_CHECK(km.dtype() == dtype, "q and km must have the same dtype");
+         CHECK_DEVICE(x);
+-        // Layout / contiguity checks
+         TORCH_CHECK(x.stride(-1) == 1, "x must be contiguous on the last dim");
++    }
+ 
+-        /**********************
+-         * 2. Dimension logic *
+-         *********************/
++    static QuantizeBuffers allocate_buffers(
++        const at::Tensor &x,
++        const bool is_nvfp4,
++        const bool is_rht,
++        const bool is_transpose)
++    {
++        QuantizeBuffers buf;
+ 
+-        const int M = is_transpose ? x.size(1) : x.size(0);
+-        const int N = is_transpose ? x.size(0) : x.size(1);
++        buf.M = is_transpose ? x.size(1) : x.size(0);
++        buf.N = is_transpose ? x.size(0) : x.size(1);
+ 
+         const int n_round = is_nvfp4 ? 64 : 128;
+-        TORCH_CHECK(N % n_round == 0, "N must be multiple of " + std::to_string(n_round));
+-
+-        /**********************
+-         * 3. Derived sizes   *
+-         *********************/
+-        auto round_up = [](int x, int m)
+-        { return (x + m - 1) / m * m; };
+-
+-        const int M_rounded = round_up(M, 128);
+-        const int N_rounded = round_up(N, n_round);
+-
+-        // const int max_seqlen_km       = ceil_div(max_seqlen_k, moba_chunk_size);
+-        // const int head_size_rounded   = round_up(head_size, head_size <= 128 ? 32 : 64);
+-        // const int seqlen_q_rounded    = round_up(max_seqlen_q, 128);
+-        // const int seqlen_km_rounded   = round_up(max_seqlen_km, 128);
+-        // const int moba_topk_rounded   = round_up(moba_topk, 16);
+-
+-        /**********************
+-         * 4. Intermediate buffers  *
+-         *********************/
+-        at::Tensor x_rht;
+-        if (is_rht)
++        TORCH_CHECK(buf.N % n_round == 0,
++                    "N must be multiple of " + std::to_string(n_round));
++
++        auto round_up = [](int v, int m)
++        { return (v + m - 1) / m * m; };
++
++        buf.M_rounded = round_up(buf.M, 128);
++        buf.N_rounded = round_up(buf.N, n_round);
++
++        // Intermediate RHT buffer
++        buf.x_rht = is_rht
++                         ? torch::zeros({buf.M_rounded, buf.N_rounded}, x.options())
++                         : torch::zeros({0, 0}, x.options());
++
++        // Output buffers
++        buf.x_e2m1 = torch::zeros(
++            {buf.M_rounded, buf.N_rounded / 2},
++            x.options().dtype(torch::kUInt8));
++
++        if (is_nvfp4)
+         {
+-            x_rht = torch::zeros({M_rounded, N_rounded}, x.options());
++            buf.M_sf = (buf.M_rounded / 128 * 32) * (buf.N_rounded / 64);
++            buf.N_sf = 16;
++            buf.x_sf = torch::zeros(
++                {buf.M_sf, buf.N_sf},
++                x.options().dtype(torch::kFloat8_e4m3fn));
++            buf.x_sft = torch::zeros(
++                {buf.M_rounded, buf.N_rounded / 16},
++                x.options().dtype(torch::kFloat32));
+         }
+         else
+         {
+-            x_rht = torch::zeros({0, 0}, x.options());
++            buf.M_sf = (buf.M_rounded / 128 * 32) * (buf.N_rounded / 128);
++            buf.N_sf = 16;
++            buf.x_sf = torch::zeros(
++                {buf.M_sf, buf.N_sf},
++                x.options().dtype(torch::kUInt8));
++            buf.x_sft = torch::zeros(
++                {buf.M_rounded, buf.N_rounded / 32},
++                x.options().dtype(torch::kFloat32));
+         }
+ 
+-        /**********************
+-         * 5. Output buffers  *
+-         *********************/
+-        at::Tensor x_e2m1 = torch::zeros({M_rounded, int(N_rounded / 2)}, x.options().dtype(torch::kUInt8));
+-        at::Tensor x_sf, x_sft;
+-        int M_sf, N_sf;
++        buf.amax = torch::zeros({1}, x.options().dtype(torch::kFloat32));
++
++        return buf;
++    }
++
++    static void compute_dimensions(
++        const at::Tensor &x,
++        const bool is_nvfp4,
++        const bool is_transpose,
++        int &M, int &N, int &M_rounded, int &N_rounded, int &M_sf, int &N_sf)
++    {
++        M = is_transpose ? x.size(1) : x.size(0);
++        N = is_transpose ? x.size(0) : x.size(1);
++
++        const int n_round = is_nvfp4 ? 64 : 128;
++        TORCH_CHECK(N % n_round == 0,
++                    "N must be multiple of " + std::to_string(n_round));
++
++        auto round_up = [](int v, int m)
++        { return (v + m - 1) / m * m; };
++
++        M_rounded = round_up(M, 128);
++        N_rounded = round_up(N, n_round);
++
+         if (is_nvfp4)
+         {
+-            M_sf = int(M_rounded / 128 * 32) * int(N_rounded / 64);
+-            N_sf = 16;
+-            // N_sf = int(N_rounded / 16 * 4);
+-            x_sf = torch::zeros({M_sf, N_sf}, x.options().dtype(torch::kFloat8_e4m3fn));
+-            x_sft = torch::zeros({M_rounded, int(N_rounded / 16)}, x.options().dtype(torch::kFloat32));
++            M_sf = (M_rounded / 128 * 32) * (N_rounded / 64);
+         }
+         else
+         {
+-            M_sf = int(M_rounded / 128 * 32) * int(N_rounded / 128);
+-            N_sf = 16;
+-            x_sf = torch::zeros({M_sf, N_sf}, x.options().dtype(torch::kUInt8));
+-            x_sft = torch::zeros({M_rounded, int(N_rounded / 32)}, x.options().dtype(torch::kFloat32));
++            M_sf = (M_rounded / 128 * 32) * (N_rounded / 128);
+         }
+-        at::Tensor amax = torch::zeros({1}, x.options().dtype(torch::kFloat32));
++        N_sf = 16;
++    }
++
++    /**************************************************************************
++     * Original single-op (backward compatible, phase=0)
++     **************************************************************************/
++
++    std::tuple<at::Tensor, at::Tensor, at::Tensor> quantize_to_fp4(
++        const at::Tensor &x,
++        const bool is_nvfp4,
++        const bool is_rtn,
++        const bool is_rht,
++        const bool is_2d,
++        const bool is_transpose,
++        const int64_t selection_rule,
++        const int64_t rbits)
++    {
++        at::cuda::CUDAGuard device_guard{x.device()};
++        validate_input(x, selection_rule);
++
++        auto buf = allocate_buffers(x, is_nvfp4, is_rht, is_transpose);
+ 
+-        /**********************
+-         * 5. Param struct    *
+-         *********************/
+         FP4_quant_params params;
+-        // const at::Tensor x,
+-        // at::Tensor x_rht,
+-        // at::Tensor x_e2m1,
+-        // at::Tensor x_sf,
+-        // at::Tensor amax,
+-        // const int M,
+-        // const int N,
+-        // const bool is_nvfp4,
+-        // const bool is_rtn,
+-        // const bool is_4o6,
+-        // const bool is_2d,
+-        // const bool is_transpose
+         set_params_fp4_quant(
+-            params,
+-            /*-------------- tensors ---------------*/
+-            x, x_rht, x_e2m1, x_sf, x_sft, amax, M, N, M_rounded, N_rounded, M_sf, N_sf,
++            params, x, buf.x_rht, buf.x_e2m1, buf.x_sf, buf.x_sft, buf.amax,
++            buf.M, buf.N, buf.M_rounded, buf.N_rounded, buf.M_sf, buf.N_sf,
+             is_nvfp4, is_rtn, is_rht, is_2d, is_transpose, selection_rule, rbits);
+ 
+-        /**********************
+-         * 6. Kernel launch   *
+-         *********************/
++        if (buf.M > 0)
++        {
++            run_fp4_quant(params, at::cuda::getCurrentCUDAStream().stream());
++        }
++        else
++        {
++            buf.amax.fill_(0);
++        }
+ 
+-        if (M > 0)
++        return std::make_tuple(buf.x_e2m1, buf.x_sf.flatten(), buf.amax);
++    }
++
++    /**************************************************************************
++     * Split op 1: prologue only (phase=1)
++     * Allocates all buffers and launches only the prologue kernel.
++     * Returns (x_e2m1, x_sf, x_sft, x_rht, amax) for use by quantize_fp4_main.
++     **************************************************************************/
++
++    std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
++    quantize_fp4_prologue(
++        const at::Tensor &x,
++        const bool is_nvfp4,
++        const bool is_rtn,
++        const bool is_rht,
++        const bool is_2d,
++        const bool is_transpose,
++        const int64_t selection_rule,
++        const int64_t rbits)
++    {
++        at::cuda::CUDAGuard device_guard{x.device()};
++        validate_input(x, selection_rule);
++
++        auto buf = allocate_buffers(x, is_nvfp4, is_rht, is_transpose);
++
++        FP4_quant_params params;
++        set_params_fp4_quant(
++            params, x, buf.x_rht, buf.x_e2m1, buf.x_sf, buf.x_sft, buf.amax,
++            buf.M, buf.N, buf.M_rounded, buf.N_rounded, buf.M_sf, buf.N_sf,
++            is_nvfp4, is_rtn, is_rht, is_2d, is_transpose, selection_rule, rbits);
++        params.phase = 1;
++
++        if (buf.M > 0)
+         {
+             run_fp4_quant(params, at::cuda::getCurrentCUDAStream().stream());
+         }
+         else
+         {
+-            amax.fill_(0);
++            buf.amax.fill_(0);
++        }
++
++        return std::make_tuple(buf.x_e2m1, buf.x_sf, buf.x_sft, buf.x_rht, buf.amax);
++    }
++
++    /**************************************************************************
++     * Split op 2: quant only (phase=2)
++     * Takes pre-allocated buffers from prologue and launches only the quant kernel.
++     **************************************************************************/
++
++    std::tuple<at::Tensor, at::Tensor, at::Tensor>
++    quantize_fp4_main(
++        const at::Tensor &x,
++        at::Tensor x_e2m1,
++        at::Tensor x_sf,
++        at::Tensor x_sft,
++        at::Tensor x_rht,
++        at::Tensor amax,
++        const bool is_nvfp4,
++        const bool is_rtn,
++        const bool is_rht,
++        const bool is_2d,
++        const bool is_transpose,
++        const int64_t selection_rule,
++        const int64_t rbits)
++    {
++        at::cuda::CUDAGuard device_guard{x.device()};
++        validate_input(x, selection_rule);
++
++        int M, N, M_rounded, N_rounded, M_sf, N_sf;
++        compute_dimensions(x, is_nvfp4, is_transpose, M, N, M_rounded, N_rounded, M_sf, N_sf);
++
++        FP4_quant_params params;
++        set_params_fp4_quant(
++            params, x, x_rht, x_e2m1, x_sf, x_sft, amax,
++            M, N, M_rounded, N_rounded, M_sf, N_sf,
++            is_nvfp4, is_rtn, is_rht, is_2d, is_transpose, selection_rule, rbits);
++        params.phase = 2;
++
++        if (M > 0)
++        {
++            run_fp4_quant(params, at::cuda::getCurrentCUDAStream().stream());
+         }
+ 
+         return std::make_tuple(x_e2m1, x_sf.flatten(), amax);
+@@ -241,5 +335,7 @@ namespace fouroversix
+     TORCH_LIBRARY_IMPL(fouroversix, CUDA, m)
+     {
+         m.impl("quantize_to_fp4", &quantize_to_fp4);
++        m.impl("quantize_fp4_prologue", &quantize_fp4_prologue);
++        m.impl("quantize_fp4_main", &quantize_fp4_main);
+     }
+ }
+\ No newline at end of file
+diff --git a/src/fouroversix/quantize/cuda/backend.py b/src/fouroversix/quantize/cuda/backend.py
+index fc6f0d1..481e536 100644
+--- a/src/fouroversix/quantize/cuda/backend.py
++++ b/src/fouroversix/quantize/cuda/backend.py
+@@ -89,3 +89,87 @@ class CUDAQuantizeBackend(QuantizeBackendBase):
+             (x.shape[1], x.shape[0]) if config.transpose else x.shape,
+             config.scale_rule,
+         )
++
++    @classmethod
++    def quantize_fp4_prologue(
++        cls,
++        x: torch.Tensor,
++        config: QuantizationConfig,
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++        """
++        Run only the prologue phase: compute amax and per-group scale factor temps.
++
++        Args:
++            x (torch.Tensor): The input tensor to quantize.
++            config (QuantizationConfig): The quantization configuration.
++
++        Returns:
++            A tuple of (x_e2m1, x_sf, x_sft, x_rht, amax) intermediate tensors
++            to be passed to ``quantize_fp4_main``.
++
++        """
++
++        from .ops import quantize_fp4_prologue
++
++        return quantize_fp4_prologue(
++            x,
++            config.dtype == DataType.nvfp4,
++            config.round_style == RoundStyle.nearest,
++            config.rht,
++            config.block_scale_2d,
++            config.transpose,
++            config.scale_rule.cuda_id(),
++            0,
++        )
++
++    @classmethod
++    def quantize_fp4_main(
++        cls,
++        x: torch.Tensor,
++        intermediates: tuple[
++            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
++        ],
++        config: QuantizationConfig,
++    ) -> QuantizedTensor:
++        """
++        Run only the quant phase using pre-computed intermediates from prologue.
++
++        Args:
++            x (torch.Tensor): The original input tensor.
++            intermediates: The (x_e2m1, x_sf, x_sft, x_rht, amax) tuple returned
++                by ``quantize_fp4_prologue``.
++            config (QuantizationConfig): The quantization configuration.
++
++        Returns:
++            The quantized tensor.
++
++        """
++
++        from .ops import quantize_fp4_main
++
++        x_e2m1, x_sf, x_sft, x_rht, amax = intermediates
++
++        values, scale_factors, amax = quantize_fp4_main(
++            x,
++            x_e2m1,
++            x_sf,
++            x_sft,
++            x_rht,
++            amax,
++            config.dtype == DataType.nvfp4,
++            config.round_style == RoundStyle.nearest,
++            config.rht,
++            config.block_scale_2d,
++            config.transpose,
++            config.scale_rule.cuda_id(),
++            0,
++        )
++
++        return QuantizedTensor(
++            values,
++            scale_factors,
++            amax,
++            config.dtype,
++            (x.shape[1], x.shape[0]) if config.transpose else x.shape,
++            config.scale_rule,
++        )
+diff --git a/src/fouroversix/quantize/cuda/ops.py b/src/fouroversix/quantize/cuda/ops.py
+index a07efda..ee417af 100644
+--- a/src/fouroversix/quantize/cuda/ops.py
++++ b/src/fouroversix/quantize/cuda/ops.py
+@@ -3,6 +3,11 @@ import torch
+ import fouroversix._C  # noqa: F401
+ 
+ 
++# ---------------------------------------------------------------------------
++# Original single-op (backward compatible)
++# ---------------------------------------------------------------------------
++
++
+ def quantize_to_fp4(
+     x: torch.Tensor,
+     is_nvfp4: bool,  # noqa: FBT001
+@@ -45,3 +50,128 @@ def _(
+         ),
+         torch.empty(1, dtype=torch.float32, device=x.device),
+     )
++
++
++# ---------------------------------------------------------------------------
++# Split op 1: prologue only — computes amax + per-group scale factor temps
++# ---------------------------------------------------------------------------
++
++
++def quantize_fp4_prologue(
++    x: torch.Tensor,
++    is_nvfp4: bool,  # noqa: FBT001
++    is_rtn: bool,  # noqa: FBT001
++    is_rht: bool,  # noqa: FBT001
++    is_2d: bool,  # noqa: FBT001
++    is_transpose: bool,  # noqa: FBT001
++    selection_rule: int,
++    rbits: int,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Returns (x_e2m1, x_sf, x_sft, x_rht, amax)."""
++    return torch.ops.fouroversix.quantize_fp4_prologue.default(
++        x,
++        is_nvfp4,
++        is_rtn,
++        is_rht,
++        is_2d,
++        is_transpose,
++        selection_rule,
++        rbits,
++    )
++
++
++@torch.library.register_fake("fouroversix::quantize_fp4_prologue")
++def _(
++    x: torch.Tensor,
++    is_nvfp4: bool,  # noqa: FBT001
++    is_rtn: bool,  # noqa: ARG001, FBT001
++    is_rht: bool,  # noqa: FBT001
++    is_2d: bool,  # noqa: ARG001, FBT001
++    is_transpose: bool,  # noqa: ARG001, FBT001
++    selection_rule: int,  # noqa: ARG001
++    rbits: int,  # noqa: ARG001
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    group_size = 16 if is_nvfp4 else 32
++    sf_dtype = torch.float8_e4m3fn if is_nvfp4 else torch.uint8
++    num_sf = x.shape[0] * x.shape[1] // group_size
++    return (
++        # x_e2m1: pre-allocated output (filled by quant kernel later)
++        torch.empty(x.shape[0], x.shape[1] // 2, dtype=torch.uint8, device=x.device),
++        # x_sf: 2D, not flattened (filled by quant kernel later)
++        torch.empty(num_sf // 16, 16, dtype=sf_dtype, device=x.device),
++        # x_sft: per-group scale factor temps (written by prologue)
++        torch.empty(
++            x.shape[0], x.shape[1] // group_size, dtype=torch.float32, device=x.device
++        ),
++        # x_rht: RHT intermediate (or empty if not used)
++        torch.empty(
++            *(x.shape if is_rht else (0, 0)), dtype=x.dtype, device=x.device
++        ),
++        # amax: global absmax scalar (written by prologue)
++        torch.empty(1, dtype=torch.float32, device=x.device),
++    )
++
++
++# ---------------------------------------------------------------------------
++# Split op 2: quant only — quantizes using pre-computed amax + scale temps
++# ---------------------------------------------------------------------------
++
++
++def quantize_fp4_main(
++    x: torch.Tensor,
++    x_e2m1: torch.Tensor,
++    x_sf: torch.Tensor,
++    x_sft: torch.Tensor,
++    x_rht: torch.Tensor,
++    amax: torch.Tensor,
++    is_nvfp4: bool,  # noqa: FBT001
++    is_rtn: bool,  # noqa: FBT001
++    is_rht: bool,  # noqa: FBT001
++    is_2d: bool,  # noqa: FBT001
++    is_transpose: bool,  # noqa: FBT001
++    selection_rule: int,
++    rbits: int,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Returns (x_e2m1, x_sf_flat, amax) — same as quantize_to_fp4."""
++    return torch.ops.fouroversix.quantize_fp4_main.default(
++        x,
++        x_e2m1,
++        x_sf,
++        x_sft,
++        x_rht,
++        amax,
++        is_nvfp4,
++        is_rtn,
++        is_rht,
++        is_2d,
++        is_transpose,
++        selection_rule,
++        rbits,
++    )
++
++
++@torch.library.register_fake("fouroversix::quantize_fp4_main")
++def _(
++    x: torch.Tensor,
++    x_e2m1: torch.Tensor,  # noqa: ARG001
++    x_sf: torch.Tensor,
++    x_sft: torch.Tensor,  # noqa: ARG001
++    x_rht: torch.Tensor,  # noqa: ARG001
++    amax: torch.Tensor,  # noqa: ARG001
++    is_nvfp4: bool,  # noqa: FBT001
++    is_rtn: bool,  # noqa: ARG001, FBT001
++    is_rht: bool,  # noqa: ARG001, FBT001
++    is_2d: bool,  # noqa: ARG001, FBT001
++    is_transpose: bool,  # noqa: ARG001, FBT001
++    selection_rule: int,  # noqa: ARG001
++    rbits: int,  # noqa: ARG001
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    return (
++        torch.empty(x.shape[0], x.shape[1] // 2, dtype=torch.uint8, device=x.device),
++        torch.empty(
++            x_sf.numel(),
++            dtype=torch.float8_e4m3fn if is_nvfp4 else torch.float8_e8m0fnu,
++            device=x.device,
++        ),
++        torch.empty(1, dtype=torch.float32, device=x.device),
++    )
 diff --git a/src/fouroversix/quantize/quantized_tensor.py b/src/fouroversix/quantize/quantized_tensor.py
 index ff0c653..7020efe 100644
 --- a/src/fouroversix/quantize/quantized_tensor.py

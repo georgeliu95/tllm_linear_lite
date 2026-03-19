@@ -93,31 +93,27 @@ Default mode runs correctness then prints a comparison table covering:
 - **tllm(mse/abs_max/mae)** — adaptive 4/6 kernel (native CUDA, streaming)
 - **f46(mse/abs_max/mae)** — fouroversix (if installed)
 
-The table reports two timing rows for fair comparison:
-- **Kernel only** — quantize kernel alone (tllm scale precomputed; f46 includes its own prologue)
-- **End-to-end** — prologue (`triton_amax` → global scale) + quantize kernel for tllm; same as kernel-only for f46 (prologue is internal)
+All backends are split into **Prologue** (amax/scale computation) and **Quant** (quantization kernel) for fair comparison.
 
 Sample output (B200, `(14400, 6144)`, bf16):
 
 ```
-  Metric                             tllm     tllm(mse) tllm(abs_max)     tllm(mae)      f46(mse)  f46(abs_max)      f46(mae)
-  ---------------------------------------------------------------------------------------------------------------------------
-  Kernel only (us)                  52.00         83.44         79.11         81.87        454.53        466.24        459.67
-  End-to-end (us)                  122.49        183.80        180.90        181.41        454.53        466.24        459.67
-  E2E BW (TB/s)                      1.85          1.23          1.25          1.25          0.50          0.49          0.49
-  E2E MBU %                         23.1%         15.4%         15.7%         15.6%          6.2%          6.1%          6.2%
-  Kernel speedup                    1.00x         0.62x         0.66x         0.64x           N/A           N/A           N/A
-  E2E speedup                       1.00x         0.67x         0.68x         0.68x         0.27x         0.26x         0.27x
-
-  Prologue: triton_amax = 70.49 us (included in end-to-end; f46 includes its own prologue)
+  Metric                        tllm     tllm/mse tllm/abs_max     tllm/mae      f46/mse  f46/abs_max      f46/mae  f46/static_6
+  -------------------------------------------------------------------------------------------------------------------------------
+  Prologue (us)                75.37        75.15        75.12        75.37       101.98       102.81        99.07       102.81
+  Quant (us)                   54.35        86.10        79.29        83.83       383.84       167.08       371.69       167.08
+  Total (us)                  129.72       161.25       154.41       159.20       485.82       269.89       470.76       269.89
+  BW (TB/s)                     1.75         1.41         1.47         1.42         0.47         0.84         0.48         0.84
+  MBU %                        21.8%        17.6%        18.4%        17.8%         5.8%        10.5%         6.0%        10.5%
+  Speedup vs tllm              1.00x        0.80x        0.84x        0.81x        0.27x        0.48x        0.28x        0.48x
 ```
 
-- **Kernel only**: CUDA event elapsed time for the quantize kernel alone
-- **End-to-end**: Prologue (`triton_amax` → global scale) + quantize kernel for tllm; f46 includes its built-in prologue
-- **E2E BW**: `(input_bytes + output_bytes) / end_to_end_time`
-- **E2E MBU %**: E2E BW / peak HBM BW (B200 = 8.0 TB/s)
-- **Kernel speedup**: `tllm_kernel / other_kernel` (>1 = faster); N/A for f46 (kernel time includes prologue)
-- **E2E speedup**: `tllm_e2e / other_e2e` (>1 = faster); apples-to-apples across all columns
+- **Prologue**: `triton_amax` → global scale (tllm); `quantize_fp4_prologue` (fouroversix)
+- **Quant**: `fp4_quantize` kernel (tllm); `quantize_fp4_main` (fouroversix)
+- **Total**: Prologue + Quant
+- **BW**: `(input_bytes + output_bytes) / total_time`
+- **MBU %**: BW / peak HBM BW (B200 = 8.0 TB/s)
+- **Speedup**: `tllm_total / other_total` (>1 = faster than tllm)
 
 The `--scale-rule` flag runs a focused single-rule benchmark:
 
@@ -172,7 +168,7 @@ Followed by a summary table (pandas DataFrame) of all results.
 
 ## test_nvfp4_linear.py
 
-End-to-end correctness test for `NVFP4DynamicLinear` — the `nn.Module` that fuses dynamic quantization + GEMM.
+End-to-end correctness and benchmark for `NVFP4DynamicLinear` — the `nn.Module` that fuses dynamic quantization + GEMM.
 
 ### CLI
 
@@ -180,14 +176,18 @@ End-to-end correctness test for `NVFP4DynamicLinear` — the `nn.Module` that fu
 |------|---------|-------------|
 | `--dtype` | `bfloat16` | `float16` or `bfloat16` |
 | `--gemm-backend` | `auto` | `auto`, `cutlass`, `cublaslt`, `cutedsl` |
-| `--quant-backend` | `tllm` | `tllm`, `fouroversix`, `all` |
+| `--quant-backend` | `all` | `tllm`, `fouroversix`, `all` |
 | `--no-bias` | off | Skip bias tests |
+| `--skip-verify` | off | Skip correctness, benchmark only |
+| `--warmup` | `5` | Benchmark warmup iterations |
+| `--repeat` | `20` | Benchmark timed iterations |
 
 ### Test Cases
 
 | Test | What it checks |
 |------|---------------|
 | Correctness (multi-shape) | Cosine similarity vs `nn.Linear` across LLM-typical shapes |
+| tllm adaptive (mse/abs_max/mae) | Adaptive 4/6 scale rules via tllm backend |
 | N-D input | 3-D input `(B, S, K)` propagation |
 | state_dict round-trip | Save → load → output bit-exact |
 | Zero input | Numerical stability with all-zero activations |
@@ -197,10 +197,41 @@ End-to-end correctness test for `NVFP4DynamicLinear` — the `nn.Module` that fu
 ### Examples
 
 ```bash
-python tests/test_nvfp4_linear.py
 python tests/test_nvfp4_linear.py --gemm-backend cublaslt
-python tests/test_nvfp4_linear.py --quant-backend all   # includes fouroversix
+python tests/test_nvfp4_linear.py --skip-verify   # benchmark only
+python tests/test_nvfp4_linear.py --quant-backend tllm --no-bias
 ```
+
+### Benchmark Output
+
+Per-shape unified table with Prologue / Quant / GEMM breakdown across all quant
+configs. Sample output (B200, bf16, gemm=cublaslt):
+
+```
+  Shape: (128, 6144, 6144)
+  Metric                        tllm      tllm/mse  tllm/abs_max      tllm/mae       f46/mse       f46/mae  f46/static_6
+  ------------------------------------------------------------------------------------------------------------------------
+  Prologue (us)                65.26         64.84         65.08         65.03         38.15         38.71         38.54
+  Quant (us)                   14.00         14.54         14.47         14.72         34.04         36.27         19.54
+  GEMM (us)                    40.00         40.31         40.28         39.91         39.89         40.03         40.24
+  Total (us)                  119.26        119.68        119.83        119.66        112.08        115.01         98.32
+  TFLOPS                       81.03         80.74         80.65         80.76         86.22         84.03         98.29
+  Speedup vs tllm              1.00x         1.00x         1.00x         1.00x         1.06x         1.04x         1.21x
+
+  Shape: (14400, 6144, 6144)
+  Metric                        tllm      tllm/mse  tllm/abs_max      tllm/mae       f46/mse       f46/mae  f46/static_6
+  ------------------------------------------------------------------------------------------------------------------------
+  Prologue (us)                76.06         75.80         77.54         77.00        102.05        102.42        102.33
+  Quant (us)                   54.18         85.81         79.01         83.53        383.17        375.67        167.02
+  GEMM (us)                   203.99        202.50        202.94        202.25        202.68        203.14        202.68
+  Total (us)                  334.23        364.11        359.49        362.78        687.90        681.23        472.03
+  TFLOPS                     3252.72       2985.79       3024.21       2996.79       1580.41       1595.89       2303.17
+  Speedup vs tllm              1.00x         0.92x         0.93x         0.92x         0.49x         0.49x         0.71x
+```
+
+- **Prologue**: `triton_amax` → global scale (tllm); `quantize_fp4_prologue` (fouroversix)
+- **Quant**: `fp4_quantize` kernel (tllm); `quantize_fp4_main` (fouroversix)
+- **GEMM**: `nvfp4_gemm` (same backend for all configs within a shape)
 
 ---
 

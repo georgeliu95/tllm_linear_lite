@@ -774,13 +774,13 @@ def benchmark(
             print(f"\n  [WARN] tllm adaptive ({rule}) benchmark failed: {e}")
 
     # ================================================================
-    # fouroversix: each scale rule measured separately
+    # fouroversix: prologue and quant measured separately via split ops
     # ================================================================
     _F46_SCALE_RULES = ("mse", "abs_max", "mae")
-    f46_times: dict[str, float] = {}
+    f46_prologue_times: dict[str, float] = {}
+    f46_quant_times: dict[str, float] = {}
 
     if FOUROVERSIX_AVAILABLE:
-        from fouroversix import QuantizationConfig as F46Config
         from fouroversix.utils import ScaleRule as F46ScaleRule
 
         _F46_RULE_MAP = {"mse": F46ScaleRule.mse, "abs_max": F46ScaleRule.abs_max, "mae": F46ScaleRule.mae}
@@ -788,54 +788,73 @@ def benchmark(
         for rule in _F46_SCALE_RULES:
             try:
                 f46_rule_int = _F46_RULE_MAP[rule].cuda_id()
+                op_args = (input_tensor, True, True, False, False, False, f46_rule_int, 0)
 
                 with nvtx.annotate(f"benchmark/f46_{rule}/warmup"):
                     for _ in range(warmup):
-                        _ = torch.ops.fouroversix.quantize_to_fp4(
-                            input_tensor, True, True, False, False, False, f46_rule_int, 0,
+                        intermediates = torch.ops.fouroversix.quantize_fp4_prologue(*op_args)
+                        _ = torch.ops.fouroversix.quantize_fp4_main(
+                            input_tensor, *intermediates, True, True, False, False, False,
+                            f46_rule_int, 0,
                         )
                     torch.cuda.synchronize()
 
-                times = []
+                prologue_times: list[float] = []
+                quant_times: list[float] = []
+
                 with nvtx.annotate(f"benchmark/f46_{rule}/timed"):
                     for i in range(repeat):
-                        start = torch.cuda.Event(enable_timing=True)
-                        end = torch.cuda.Event(enable_timing=True)
-                        rng = nvtx.start_range(f"f46_{rule}/iter_{i}")
-                        start.record()
-                        _ = torch.ops.fouroversix.quantize_to_fp4(
-                            input_tensor, True, True, False, False, False, f46_rule_int, 0,
-                        )
-                        end.record()
+                        s0 = torch.cuda.Event(enable_timing=True)
+                        e0 = torch.cuda.Event(enable_timing=True)
+                        rng = nvtx.start_range(f"f46_{rule}_prologue/iter_{i}")
+                        s0.record()
+                        intermediates = torch.ops.fouroversix.quantize_fp4_prologue(*op_args)
+                        e0.record()
                         nvtx.end_range(rng)
-                        torch.cuda.synchronize()
-                        times.append(start.elapsed_time(end) * 1000)  # ms -> us
 
-                f46_times[rule] = sum(times) / len(times)
+                        s1 = torch.cuda.Event(enable_timing=True)
+                        e1 = torch.cuda.Event(enable_timing=True)
+                        rng = nvtx.start_range(f"f46_{rule}_quant/iter_{i}")
+                        s1.record()
+                        _ = torch.ops.fouroversix.quantize_fp4_main(
+                            input_tensor, *intermediates, True, True, False, False, False,
+                            f46_rule_int, 0,
+                        )
+                        e1.record()
+                        nvtx.end_range(rng)
+
+                        torch.cuda.synchronize()
+                        prologue_times.append(s0.elapsed_time(e0) * 1000)
+                        quant_times.append(s1.elapsed_time(e1) * 1000)
+
+                f46_prologue_times[rule] = sum(prologue_times) / len(prologue_times)
+                f46_quant_times[rule] = sum(quant_times) / len(quant_times)
             except Exception as e:
                 print(f"\n  [WARN] fouroversix ({rule}) benchmark failed: {e}")
     else:
         print("\n  fouroversix: [SKIP] not installed")
 
     # ================================================================
-    # Unified performance table (tllm = baseline)
+    # Unified performance table — every column has (prologue, quant)
     # ================================================================
     col_names: list[str] = ["tllm"]
-    kernel_times: list[float] = [tllm_kernel_us]
-    e2e_times_list: list[float] = [tllm_e2e_us]
-    kernel_only_col: list[bool] = [True]
+    prologue_us_list: list[float] = [scale_time_us]
+    quant_us_list: list[float] = [tllm_kernel_us]
+
     for rule in _ADAPTIVE_RULES:
         if rule in adaptive_kernel_times:
             col_names.append(f"tllm({rule})")
-            kernel_times.append(adaptive_kernel_times[rule])
-            e2e_times_list.append(adaptive_e2e_times.get(rule, adaptive_kernel_times[rule]))
-            kernel_only_col.append(True)
+            prologue_us_list.append(scale_time_us)
+            quant_us_list.append(adaptive_kernel_times[rule])
+
     for rule in _F46_SCALE_RULES:
-        if rule in f46_times:
+        if rule in f46_prologue_times:
             col_names.append(f"f46({rule})")
-            kernel_times.append(f46_times[rule])
-            e2e_times_list.append(f46_times[rule])
-            kernel_only_col.append(False)
+            prologue_us_list.append(f46_prologue_times[rule])
+            quant_us_list.append(f46_quant_times[rule])
+
+    total_us_list = [p + q for p, q in zip(prologue_us_list, quant_us_list)]
+    tllm_total_us = total_us_list[0]
 
     col_w = 14
     header = f"  {'Metric':<25}" + "".join(f"{n:>{col_w}}" for n in col_names)
@@ -844,51 +863,32 @@ def benchmark(
     print(f"\n{header}")
     print(sep)
 
-    # Kernel-only time
-    print(f"  {'Kernel only (us)':<25}" + "".join(
-        f"{t:>{col_w}.2f}" for t in kernel_times
+    print(f"  {'Prologue (us)':<25}" + "".join(
+        f"{t:>{col_w}.2f}" for t in prologue_us_list
+    ))
+    print(f"  {'Quant (us)':<25}" + "".join(
+        f"{t:>{col_w}.2f}" for t in quant_us_list
+    ))
+    print(f"  {'Total (us)':<25}" + "".join(
+        f"{t:>{col_w}.2f}" for t in total_us_list
     ))
 
-    # End-to-end time (prologue + kernel for tllm; f46 already includes prologue)
-    print(f"  {'End-to-end (us)':<25}" + "".join(
-        f"{t:>{col_w}.2f}" for t in e2e_times_list
-    ))
-
-    # Effective bandwidth (based on end-to-end time)
-    bws = [total_bytes / (t * 1e-6) / 1e12 for t in e2e_times_list]
-    print(f"  {'E2E BW (TB/s)':<25}" + "".join(
+    bws = [total_bytes / (t * 1e-6) / 1e12 for t in total_us_list]
+    print(f"  {'BW (TB/s)':<25}" + "".join(
         f"{bw:>{col_w}.2f}" for bw in bws
     ))
 
-    # Memory bandwidth utilization (based on end-to-end time)
     mbus = [bw / peak_bw * 100 for bw in bws]
-    print(f"  {'E2E MBU %':<25}" + "".join(
+    print(f"  {'MBU %':<25}" + "".join(
         f"{m:>{col_w - 1}.1f}%" for m in mbus
     ))
 
-    # Kernel speedup vs tllm (N/A for f46 whose kernel time includes prologue)
-    if len(kernel_times) > 1:
-        def _kernel_speedup(i: int, t: float) -> str:
-            if i == 0:
-                return f"{'1.00x':>{col_w}}"
-            if not kernel_only_col[i]:
-                return f"{'N/A':>{col_w}}"
-            return f"{tllm_kernel_us / t:>{col_w - 1}.2f}x"
-
-        print(f"  {'Kernel speedup':<25}" + "".join(
-            _kernel_speedup(i, t) for i, t in enumerate(kernel_times)
-        ))
-
-    # E2E speedup vs tllm (>1 means faster than tllm)
-    if len(e2e_times_list) > 1:
-        print(f"  {'E2E speedup':<25}" + "".join(
+    if len(col_names) > 1:
+        print(f"  {'Speedup vs tllm':<25}" + "".join(
             f"{'1.00x':>{col_w}}" if i == 0
-            else f"{tllm_e2e_us / t:>{col_w - 1}.2f}x"
-            for i, t in enumerate(e2e_times_list)
+            else f"{tllm_total_us / t:>{col_w - 1}.2f}x"
+            for i, t in enumerate(total_us_list)
         ))
-
-    print(f"\n  Prologue: triton_amax = {scale_time_us:.2f} us"
-          f" (included in end-to-end; f46 includes its own prologue)")
 
     # Output statistics
     print(f"\n  Output statistics:")
