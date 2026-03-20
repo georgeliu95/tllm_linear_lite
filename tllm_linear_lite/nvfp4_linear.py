@@ -48,7 +48,7 @@ from tllm_linear_lite.quantize import (
     _TLLM_QUANT_RANGE,
     _FOUROVERSIX_QUANT_RANGE,
 )
-from tllm_linear_lite.amax import triton_amax
+from tllm_linear_lite.amax import triton_amax, cuda_prologue
 from tllm_linear_lite.nvfp4_gemm import nvfp4_gemm, _is_blackwell_sm
 from tllm_linear_lite.cutedsl import IS_CUTLASS_DSL_AVAILABLE
 
@@ -58,6 +58,11 @@ from tllm_linear_lite.cutedsl import IS_CUTLASS_DSL_AVAILABLE
 # global_scale safely within float32 range while still being negligible
 # compared to any realistic activation magnitude.
 _EPS: float = 1e-12
+
+# Below this element count, PyTorch abs().max() is faster than triton_amax
+# due to lower launch overhead.  Crossover measured on B200 at ~16M elements
+# (e.g. M=2048, K=6144).  See benchmark in test_nvfp4_linear.py.
+_TRITON_AMAX_THRESHOLD: int = 16_000_000
 
 # Valid GEMM backends for this module (cuda_core excluded — SWIZZLED only)
 _VALID_GEMM_BACKENDS = ("auto", "cutedsl", "cutlass", "cublaslt")
@@ -364,8 +369,13 @@ class NVFP4DynamicLinear(nn.Module):
             tensor on the same device.
         """
         if self.quant_backend == "tllm":
-            act_amax = triton_amax(x).float().clamp_min(_EPS)
-            act_gs = self.quant_range / act_amax
+            if x.numel() >= _TRITON_AMAX_THRESHOLD:
+                act_amax = triton_amax(x).float().clamp_min(_EPS)
+                act_gs = self.quant_range / act_amax
+            else:
+                act_amax, act_gs = cuda_prologue(
+                    x, quant_range=self.quant_range, eps=_EPS,
+                )
             act_fp4, act_sf = fp4_quantize(
                 x, global_scale=act_gs, swizzled=True,
                 scale_rule=self.scale_rule,

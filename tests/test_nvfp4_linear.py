@@ -594,7 +594,7 @@ def benchmark_linear(
     For each shape, measures activation prologue (amax/scale), quant kernel,
     and GEMM separately across all configs, then prints a unified table.
 
-    For tllm backend: prologue = triton_amax + scale, quant = fp4_quantize.
+    For tllm backend: prologue = cuda_prologue (single-kernel amax + scale), quant = fp4_quantize.
     For fouroversix: prologue = quantize_fp4_prologue, quant = quantize_fp4_main.
 
     Args:
@@ -607,7 +607,7 @@ def benchmark_linear(
         repeat: Timed iterations.
     """
     from tllm_linear_lite.nvfp4_gemm import nvfp4_gemm
-    from tllm_linear_lite.amax import triton_amax
+    from tllm_linear_lite.amax import cuda_prologue
     from tllm_linear_lite.quantize import (
         fp4_quantize as _fp4_quantize,
         _SCALE_RULE_MAP as _srm,
@@ -655,12 +655,12 @@ def benchmark_linear(
                 qr = _fqr if is_adaptive else _tqr
 
                 def _prologue():
-                    return qr / triton_amax(x_2d).float().clamp_min(_EPS)
+                    return cuda_prologue(x_2d, quant_range=qr, eps=_EPS)
 
                 prologue_us = _measure_us(_prologue, warmup, repeat)
 
                 with torch.no_grad():
-                    act_gs = _prologue()
+                    act_amax, act_gs = _prologue()
 
                 def _quant():
                     return _fp4_quantize(x_2d, global_scale=act_gs, swizzled=True, scale_rule=sr)
@@ -669,7 +669,6 @@ def benchmark_linear(
 
                 with torch.no_grad():
                     act_fp4, act_sf = _quant()
-                    act_amax = triton_amax(x_2d).float().clamp_min(_EPS)
 
             else:
                 from fouroversix.quantize.cuda import CUDAQuantizeBackend

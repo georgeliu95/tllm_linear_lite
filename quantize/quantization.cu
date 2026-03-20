@@ -323,6 +323,98 @@ namespace kernels
          &config, computePerTokenGlobalScaleForFP4QuantizationKernel<T>, b, m, n, input, tokensPerBatch, globalScale));
  }
  
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Global Amax: TRUE single-kernel reduction using last-block pattern.
+//
+// Phase 1: each block computes per-row absmax via getMaxAbs + blockReduceMaxV2,
+//          writes to blockMaxBuf[blockIdx.x].
+// Phase 2: last block (detected via atomic counter) reduces blockMaxBuf → globalAmax.
+//
+// No zero-init of globalAmax needed (last block writes unconditionally).
+// retirementCount is self-resetting (last block sets it back to 0).
+
+template <typename T>
+__global__ void computeGlobalAmaxKernel(
+    int m, int n, T const* input,
+    float* blockMaxBuf, float* output, int* retirementCount,
+    float quantRange, float eps)
+{
+    static constexpr int ElemsPerVec = 16 / sizeof(T);
+
+    // Phase 1: per-block row max (same logic as per-token kernel)
+    float blockMax = 0.f;
+    for (int rowIdx = blockIdx.x; rowIdx < m; rowIdx += gridDim.x)
+    {
+        float rowMaxAbsVal = 0.f;
+        for (int vecIdx = threadIdx.x; vecIdx < n / ElemsPerVec; vecIdx += blockDim.x)
+        {
+            float4 vec = reinterpret_cast<float4 const*>(input + rowIdx * n)[vecIdx];
+            float maxAbsVal = getMaxAbs<T>(vec);
+            rowMaxAbsVal = cuda_max(rowMaxAbsVal, maxAbsVal);
+        }
+        blockMax = cuda_max(blockMax, rowMaxAbsVal);
+    }
+    if (threadIdx.x == 0)
+    {
+        blockMaxBuf[blockIdx.x] = blockMax;
+    }
+
+    __threadfence();
+
+    // Retire this block; last block does the final reduction.
+    __shared__ bool isLastBlock;
+    if (threadIdx.x == 0)
+    {
+        int ticket = atomicAdd(retirementCount, 1);
+        isLastBlock = (ticket == gridDim.x - 1);
+    }
+    __syncthreads();
+
+    if (isLastBlock)
+    {
+        float maxVal = 0.f;
+        for (int i = threadIdx.x; i < gridDim.x; i += blockDim.x)
+        {
+            maxVal = cuda_max(maxVal, blockMaxBuf[i]);
+        }
+        blockReduceMaxV2<float, 1>(&maxVal);
+        if (threadIdx.x == 0)
+        {
+            float amax = fmaxf(maxVal, eps);
+            output[0] = amax;
+            output[1] = (quantRange > 0.f) ? (quantRange / amax) : amax;
+            *retirementCount = 0;
+        }
+    }
+}
+
+template <typename T>
+void computeGlobalAmax(
+    int m, int n, T const* input,
+    float* blockMaxBuf, float* output, int* retirementCount,
+    float quantRange, float eps,
+    int multiProcessorCount, cudaStream_t stream)
+{
+    static constexpr int ElemsPerVec = 16 / sizeof(T);
+    TLLM_CHECK(n % (ElemsPerVec * 32) == 0);
+    dim3 block(std::min(n / ElemsPerVec, 1024));
+    dim3 grid(std::min(m, multiProcessorCount * 4));
+
+    cudaLaunchConfig_t config;
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(
+        &config, computeGlobalAmaxKernel<T>,
+        m, n, input, blockMaxBuf, output, retirementCount, quantRange, eps));
+}
+
  // Instantiate the function.
  template void invokeFP4Quantization<half, 16>(int b, int m, int n, half const* input, float const* SFScale,
      int64_t* output, int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount,
@@ -332,6 +424,9 @@ template void invokeFP4Quantization<half, 32>(int b, int m, int n, half const* i
     cudaStream_t stream, int kernelVersion, int scaleRule);
 template void computePerTokenGlobalScaleForFP4Quantization<half>(int b, int m, int n, half const* input,
      int const* tokensPerBatch, float* globalScale, int multiProcessorCount, cudaStream_t stream);
+template void computeGlobalAmax<half>(int m, int n, half const* input,
+     float* blockMaxBuf, float* output, int* retirementCount,
+     float quantRange, float eps, int multiProcessorCount, cudaStream_t stream);
  #ifdef ENABLE_BF16
  template void invokeFP4Quantization<__nv_bfloat16, 16>(int b, int m, int n, __nv_bfloat16 const* input,
      float const* SFScale, int64_t* output, int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout,
@@ -342,6 +437,9 @@ template void invokeFP4Quantization<__nv_bfloat16, 32>(int b, int m, int n, __nv
 template void computePerTokenGlobalScaleForFP4Quantization<__nv_bfloat16>(int b, int m, int n,
      __nv_bfloat16 const* input, int const* tokensPerBatch, float* globalScale, int multiProcessorCount,
      cudaStream_t stream);
+template void computeGlobalAmax<__nv_bfloat16>(int m, int n, __nv_bfloat16 const* input,
+     float* blockMaxBuf, float* output, int* retirementCount,
+     float quantRange, float eps, int multiProcessorCount, cudaStream_t stream);
  #endif
  
  #ifdef ENABLE_FP8

@@ -58,6 +58,14 @@ namespace kernels
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// Atomic max for float (positive values only — safe for amax which is always >= 0).
+// Uses IEEE 754 property: for non-negative floats, integer comparison preserves order.
+static __device__ __forceinline__ float atomicMaxFloat(float* addr, float value)
+{
+    return __int_as_float(atomicMax(reinterpret_cast<int*>(addr), __float_as_int(value)));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // FP4/MXFP8 Quantization
  
  constexpr int CVT_ELTS_PER_THREAD = 8;

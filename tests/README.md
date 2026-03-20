@@ -6,6 +6,7 @@ Correctness, performance benchmarks, and cross-validation for tllm_linear_lite.
 
 ```
 tests/
+├── test_prologue.py        # Prologue (amax → global_scale): correctness + benchmark + tuning
 ├── test_quantize.py        # FP4 quantize: correctness + performance + adaptive 4/6
 ├── test_nvfp4_gemm.py      # NVFP4 GEMM: multi-backend correctness (vs nn.Linear)
 ├── test_nvfp4_linear.py    # NVFP4DynamicLinear: end-to-end correctness
@@ -18,6 +19,78 @@ tests/
 - `tllm_linear_lite` installed (`pip install -e .`)
 - Optional: `fouroversix` (for cross-validation, see `test_fouroversix/README.md`)
 - Optional: `tensorrt_llm` (for `--compare-trtllm`)
+
+---
+
+## test_prologue.py
+
+Prologue (amax → global_scale) correctness and performance test.  Compares all
+available implementations: PyTorch baseline, Triton two-stage, CUDA single-kernel
+(`cuda_prologue`), and fouroversix.  Includes a `--tune` sweep to find the optimal
+implementation across different M values.
+
+### CLI
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--shapes` | `1,6144 128,6144 ...` | Shapes as M,K |
+| `--dtype` | `bfloat16` | `float16` or `bfloat16` |
+| `--warmup` | `10` | Warmup iterations |
+| `--repeat` | `50` | Benchmark iterations |
+| `--skip-verify` | off | Skip correctness |
+| `--tune` | off | Sweep M=1..14400 to find crossover between implementations |
+| `--tune-k` | `6144` | K dimension for tuning sweep |
+
+### Examples
+
+```bash
+# Correctness + benchmark for a single shape
+python tests/test_prologue.py --shapes 128,6144
+
+# Tuning sweep: find where each implementation wins
+python tests/test_prologue.py --tune
+
+# Full run: multiple shapes + tune
+python tests/test_prologue.py --shapes 128,6144 14400,6144 --tune
+```
+
+### Output
+
+Per-shape accuracy table followed by performance comparison:
+
+```
+  Reference:  amax = 4.968750,  global_scale = 540.981132
+
+  Candidate                amax   global_scale      rel_err   status
+  ------------------------------------------------------------------
+  pytorch              4.968750     540.981140     1.49e-08     PASS
+  triton_amax          4.968750     540.981140     1.49e-08     PASS
+  cuda_prologue        4.968750     540.981140     1.49e-08     PASS
+  f46_prologue         4.968750     540.981132     0.00e+00     PASS
+
+  Candidate        Time(us)   BW(GB/s)    vs best
+  -----------------------------------------------
+  pytorch              39.04      40.29      3.18x
+  triton_amax          54.33      28.95      4.43x
+  cuda_prologue        12.27     128.15      1.00x <<<
+  f46_prologue         30.21      52.07      2.46x
+```
+
+- **cuda_prologue**: single-kernel last-block reduction (fused amax + clamp + division)
+- **triton_amax**: Triton two-stage reduction + PyTorch `.max()` + `.clamp_min()` + division
+- **f46_prologue**: fouroversix `quantize_fp4_prologue` (includes buffer alloc + kernel)
+
+The `--tune` flag sweeps M from 1 to 14400 and reports the winner at each point:
+
+```
+  M     Elements    pytorch     triton   cuda_pro    f46_pro   winner         speedup
+  ------- ----------  ---------- ---------- ---------- ----------  -------------- --------
+        1       6,144      39.0      55.0      12.0      30.0  cuda_pro        2.50x
+      128     786,432      39.0      55.0      12.0      30.0  cuda_pro        2.50x
+    14400  88,473,600      76.0      60.0      65.0     102.0  triton          1.10x
+
+Crossover: cuda_prologue → triton_amax at M ≈ 14400
+```
 
 ---
 
@@ -95,20 +168,29 @@ Default mode runs correctness then prints a comparison table covering:
 
 All backends are split into **Prologue** (amax/scale computation) and **Quant** (quantization kernel) for fair comparison.
 
-Sample output (B200, `(14400, 6144)`, bf16):
+Sample output (B200, bf16):
 
 ```
-  Metric                        tllm     tllm/mse tllm/abs_max     tllm/mae      f46/mse  f46/abs_max      f46/mae  f46/static_6
-  -------------------------------------------------------------------------------------------------------------------------------
-  Prologue (us)                75.37        75.15        75.12        75.37       101.98       102.81        99.07       102.81
-  Quant (us)                   54.35        86.10        79.29        83.83       383.84       167.08       371.69       167.08
-  Total (us)                  129.72       161.25       154.41       159.20       485.82       269.89       470.76       269.89
-  BW (TB/s)                     1.75         1.41         1.47         1.42         0.47         0.84         0.48         0.84
-  MBU %                        21.8%        17.6%        18.4%        17.8%         5.8%        10.5%         6.0%        10.5%
-  Speedup vs tllm              1.00x        0.80x        0.84x        0.81x        0.27x        0.48x        0.28x        0.48x
+  Shape: (128, 6144)
+  Metric                             tllm     tllm(mse) tllm(abs_max)     tllm(mae)      f46(mse)  f46(abs_max)      f46(mae)
+  ---------------------------------------------------------------------------------------------------------------------------
+  Prologue (us)                     13.47         13.47         13.47         13.47         28.30         28.31         27.75
+  Quant (us)                        12.67         12.96         12.88         12.66         34.04         34.08         33.86
+  Total (us)                        26.14         26.43         26.35         26.13         62.34         62.40         61.61
+  Speedup vs tllm                   1.00x         0.99x         0.99x         1.00x         0.42x         0.42x         0.42x
+
+  Shape: (14400, 6144)
+  Metric                             tllm     tllm(mse) tllm(abs_max)     tllm(mae)      f46(mse)  f46(abs_max)      f46(mae)
+  ---------------------------------------------------------------------------------------------------------------------------
+  Prologue (us)                     65.70         65.70         65.70         65.70         99.71         99.40         99.33
+  Quant (us)                        55.27         85.25         78.47         82.81        383.93        397.46        389.55
+  Total (us)                       120.96        150.95        144.17        148.50        483.64        496.86        488.88
+  BW (TB/s)                          1.87          1.50          1.57          1.53          0.47          0.46          0.46
+  MBU %                             23.4%         18.8%         19.7%         19.1%          5.9%          5.7%          5.8%
+  Speedup vs tllm                   1.00x         0.80x         0.84x         0.81x         0.25x         0.24x         0.25x
 ```
 
-- **Prologue**: `triton_amax` → global scale (tllm); `quantize_fp4_prologue` (fouroversix — includes buffer allocation + zeroing + prologue kernel)
+- **Prologue**: `cuda_prologue` single-kernel amax+scale (tllm); `quantize_fp4_prologue` (fouroversix — includes buffer allocation + zeroing + prologue kernel)
 - **Quant**: `fp4_quantize` kernel (tllm); `quantize_fp4_main` (fouroversix)
 - **Total**: Prologue + Quant
 - **BW**: `(input_bytes + output_bytes) / total_time`
@@ -208,28 +290,38 @@ Per-shape unified table with Prologue / Quant / GEMM breakdown across all quant
 configs. Sample output (B200, bf16, gemm=cublaslt):
 
 ```
+  Shape: (1, 6144, 6144)
+  Metric                        tllm      tllm/mse  tllm/abs_max      tllm/mae       f46/mse       f46/mae  f46/static_6
+  ----------------------------------------------------------------------------------------------------------------------
+  Prologue (us)                15.45         15.36         15.38         15.40         39.15         38.96         39.41
+  Quant (us)                   16.36         16.16         16.11         16.03         36.44         36.86         19.38
+  GEMM (us)                    45.88         46.27         46.60         46.64         40.06         40.18         39.90
+  Total (us)                   77.69         77.78         78.09         78.07        115.65        116.00         98.69
+  TFLOPS                        0.97          0.97          0.97          0.97          0.65          0.65          0.76
+  Speedup vs tllm              1.00x         1.00x         0.99x         1.00x         0.67x         0.67x         0.79x
+
   Shape: (128, 6144, 6144)
   Metric                        tllm      tllm/mse  tllm/abs_max      tllm/mae       f46/mse       f46/mae  f46/static_6
-  ------------------------------------------------------------------------------------------------------------------------
-  Prologue (us)                65.26         64.84         65.08         65.03         38.15         38.71         38.54
-  Quant (us)                   14.00         14.54         14.47         14.72         34.04         36.27         19.54
-  GEMM (us)                    40.00         40.31         40.28         39.91         39.89         40.03         40.24
-  Total (us)                  119.26        119.68        119.83        119.66        112.08        115.01         98.32
-  TFLOPS                       81.03         80.74         80.65         80.76         86.22         84.03         98.29
-  Speedup vs tllm              1.00x         1.00x         1.00x         1.00x         1.06x         1.04x         1.21x
+  ----------------------------------------------------------------------------------------------------------------------
+  Prologue (us)                15.79         15.78         15.39         15.55         38.89         38.89         39.27
+  Quant (us)                   16.10         16.15         15.95         16.11         36.20         35.74         19.65
+  GEMM (us)                    45.35         45.63         45.73         45.91         42.20         42.25         43.09
+  Total (us)                   77.24         77.56         77.06         77.58        117.29        116.88        102.02
+  TFLOPS                      125.12        124.60        125.40        124.57         82.39         82.68         94.73
+  Speedup vs tllm              1.00x         1.00x         1.00x         1.00x         0.66x         0.66x         0.76x
 
   Shape: (14400, 6144, 6144)
   Metric                        tllm      tllm/mse  tllm/abs_max      tllm/mae       f46/mse       f46/mae  f46/static_6
-  ------------------------------------------------------------------------------------------------------------------------
-  Prologue (us)                76.06         75.80         77.54         77.00        102.05        102.42        102.33
-  Quant (us)                   54.18         85.81         79.01         83.53        383.17        375.67        167.02
-  GEMM (us)                   203.99        202.50        202.94        202.25        202.68        203.14        202.68
-  Total (us)                  334.23        364.11        359.49        362.78        687.90        681.23        472.03
-  TFLOPS                     3252.72       2985.79       3024.21       2996.79       1580.41       1595.89       2303.17
-  Speedup vs tllm              1.00x         0.92x         0.93x         0.92x         0.49x         0.49x         0.71x
+  ----------------------------------------------------------------------------------------------------------------------
+  Prologue (us)                66.41         66.22         66.05         66.31        102.27        102.14        102.64
+  Quant (us)                   54.89         85.58         79.43         85.09        388.15        393.56        166.80
+  GEMM (us)                   203.14        201.76        201.69        203.32        204.31        204.18        204.76
+  Total (us)                  324.44        353.56        347.16        354.72        694.73        699.87        474.20
+  TFLOPS                     3350.94       3074.93       3131.56       3064.84       1564.87       1553.38       2292.63
+  Speedup vs tllm              1.00x         0.92x         0.93x         0.91x         0.47x         0.46x         0.68x
 ```
 
-- **Prologue**: `triton_amax` → global scale (tllm); `quantize_fp4_prologue` (fouroversix — includes buffer allocation + zeroing + prologue kernel)
+- **Prologue**: `cuda_prologue` single-kernel amax+scale (tllm, ~15 us for M≤128); `quantize_fp4_prologue` (fouroversix — includes buffer allocation + zeroing + prologue kernel, ~39 us)
 - **Quant**: `fp4_quantize` kernel (tllm); `quantize_fp4_main` (fouroversix)
 - **GEMM**: `nvfp4_gemm` (same backend for all configs within a shape)
 

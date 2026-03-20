@@ -1,6 +1,6 @@
 # tllm_linear_lite
 
-Standalone modules for the NVFP4 GEMM pipeline, extracted from [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) with **no TensorRT-LLM dependency**. Includes FP4 quantization, NVFP4 GEMM (Cute DSL + CUTLASS + cuBLASLt + CUDA core), and Triton-based amax.
+Standalone modules for the NVFP4 GEMM pipeline, extracted from [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) with **no TensorRT-LLM dependency**. Includes FP4 quantization, NVFP4 GEMM (Cute DSL + CUTLASS + cuBLASLt + CUDA core), and single-kernel CUDA amax/global_scale prologue.
 
 ## Provided Ops
 
@@ -10,6 +10,7 @@ Standalone modules for the NVFP4 GEMM pipeline, extracted from [TensorRT-LLM](ht
 |----|-----------|-------------|
 | `torch.ops.tllm_linear_lite.fp4_quantize` | `(input, globalScale?, sfVecSize, sfUseUE8M0, isSfSwizzledLayout) -> (Tensor, Tensor)` | Block-wise FP4 (E2M1) quantization with FP8 E4M3 scale factors |
 | `torch.ops.tllm_linear_lite.calculate_nvfp4_global_scale` | `(input, tokensPerBatch?) -> Tensor` | Per-token global scale computation for NVFP4 |
+| `torch.ops.tllm_linear_lite.calculate_global_amax` | `(input, quantRange=0, eps=1e-12) -> Tensor` | Single-kernel global amax + optional fused global_scale (last-block reduction) |
 
 ### GEMM (CUDA extension)
 
@@ -27,7 +28,9 @@ Standalone modules for the NVFP4 GEMM pipeline, extracted from [TensorRT-LLM](ht
 | `fp4_quantize(...)` | `tllm_linear_lite.quantize` | Unified quantize wrapper (`backend="tllm"` or optional `backend="fouroversix"`) |
 | `calculate_nvfp4_global_scale(...)` | `tllm_linear_lite.quantize` | Per-token / global NVFP4 scale (Python wrapper over C++ op) |
 | `CuteDSLNVFP4Runner` | `tllm_linear_lite.cutedsl.runner` | Cute DSL JIT runner with SimpleTuner (SM100/103 only, bf16) |
-| `triton_amax(...)` | `tllm_linear_lite.amax` | Global absolute maximum with autotuning |
+| `cuda_prologue(...)` | `tllm_linear_lite.amax` | Single-kernel fused amax + global_scale (recommended for all M) |
+| `cuda_amax(...)` | `tllm_linear_lite.amax` | Single-kernel global amax (raw, without scale computation) |
+| `triton_amax(...)` | `tllm_linear_lite.amax` | Global absolute maximum with autotuning (legacy, slower than cuda_prologue) |
 | `triton_amax_partial(...)` | `tllm_linear_lite.amax` | Block-level partial amax (no final reduction) |
 | `NVFP4DynamicLinear` | `tllm_linear_lite.nvfp4_linear` | End-to-end W4A4 dynamic-quantized `nn.Linear` replacement (tllm or fouroversix quant, auto GEMM dispatch) |
 
@@ -55,7 +58,8 @@ tllm_linear_lite/
 │   │       └── utils.py            # make_ptr, griddepcontrol helpers
 │   └── amax/
 │       ├── __init__.py
-│       └── triton_amax.py          # Triton-based amax kernel (autotuned)
+│       ├── cuda_amax.py            # CUDA single-kernel amax/prologue (last-block reduction)
+│       └── triton_amax.py          # Triton-based amax kernel (autotuned, legacy)
 ├── quantize/                       # FP4 quantization CUDA sources
 │   ├── tllm_compat.cuh             # Standalone compat header (replaces TRT-LLM common/)
 │   ├── quantization.{h,cuh,cu}     # FP4 quantization kernels
@@ -193,18 +197,21 @@ nvfp4_cublaslt = NVFP4DynamicLinear.from_linear(linear, gemm_backend="cublaslt")
 > - Only SWIZZLED scale factor layout (cuda_core backend not used by the module)
 > - Bias epilogue fusion only on cublaslt backend; other backends use post-GEMM addition
 
-### Triton Amax
+### CUDA Prologue (amax + global_scale)
 
 ```python
-from tllm_linear_lite.amax.triton_amax import triton_amax
+from tllm_linear_lite.amax import cuda_prologue
 
-x = torch.randn(14400, 6144, device="cuda", dtype=torch.bfloat16)
-amax = triton_amax(x)
+x = torch.randn(128, 6144, device="cuda", dtype=torch.bfloat16)
+amax, global_scale = cuda_prologue(x, quant_range=2688.0)
+# Single kernel launch, ~12 us on B200 (2.5x faster than fouroversix)
 ```
 
 ## Testing
 
 ```bash
+python tests/test_prologue.py                        # prologue (amax) correctness + benchmark
+python tests/test_prologue.py --tune                 # sweep M to find optimal implementation
 python tests/test_quantize.py                        # quantize correctness + perf
 python tests/test_quantize.py --scale-rule mse       # adaptive 4/6 standalone benchmark
 python tests/test_nvfp4_gemm.py                      # GEMM multi-backend correctness
@@ -224,6 +231,7 @@ Derived from `tensorrt_llm/kernels/quantization.*`:
 - **Kept** FP4 block quantization, block scale interleave, per-token global scale
 - **Optimized** v1 kernel: 16 elements/thread with 256-bit vectorized load (LDG.E.128×2), increased ILP to hide L1TEX scoreboard stalls
 - **Added** FourOverSix adaptive 4/6 kernel (`opt_quantize_with_block_size_adaptive`): per-block fake-quant at r=6 and r=4, picks lower error (MSE/MAE/ABS_MAX); streaming design, ~40 R32 registers (launch_bounds 512×3)
+- **Added** `computeGlobalAmaxKernel` (single-kernel prologue): last-block reduction pattern — each CTA computes per-block amax via float4 load + `blockReduceMaxV2`, last CTA reduces all partials and writes both amax and `quantRange/amax`. No zero-init, no extra kernels, pre-allocated buffers. ~9 us raw / ~12 us end-to-end on B200 for M=128 K=6144.
 - See comment blocks at top of each `.h` / `.cuh` / `.cu` file for detailed diff
 
 ### GEMM kernels (`gemm/`)
@@ -244,7 +252,8 @@ See comment blocks at top of each file for detailed diff from TRT-LLM originals.
 
 - [x] `fp4_quantize` -- NVFP4 block quantization (CUDA kernel)
 - [x] `calculate_nvfp4_global_scale` -- Per-token global scale (CUDA kernel)
-- [x] `triton_amax` -- Global amax reduction (Triton kernel)
+- [x] `cuda_prologue` -- Single-kernel fused amax + global_scale (CUDA last-block reduction, ~12 us on B200, replaces triton_amax as default)
+- [x] `triton_amax` -- Global amax reduction (Triton kernel, legacy)
 - [x] `cublaslt_fp4_gemm` -- cuBLASLt NVFP4 GEMM (all shapes)
 - [x] `cuda_core_nvfp4_gemm` -- CUDA core NVFP4 GEMM (M<=16, decode)
 - [x] `nvfp4_gemm` -- Unified Python dispatch layer

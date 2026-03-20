@@ -98,6 +98,19 @@ template <typename T>
 void computePerTokenGlobalScaleForFP4Quantization(int b, int m, int n, T const* input, int const* tokensPerBatch,
     float* globalScale, int multiProcessorCount, cudaStream_t stream = 0);
 
+/// Compute global amax and optional global_scale in a single kernel launch.
+/// Uses last-block reduction (no zero-init required, self-resetting counter).
+/// @param blockMaxBuf     Temp buffer of size >= grid.x floats (no init needed)
+/// @param output          Output[0] = clamped amax, output[1] = quantRange/amax (or amax if quantRange==0)
+/// @param retirementCount Atomic counter, must be 0 on first call (self-resets)
+/// @param quantRange      If > 0, output[1] = quantRange / max(amax, eps). If 0, output[1] = amax.
+/// @param eps             Clamping floor for amax to avoid division by zero
+template <typename T>
+void computeGlobalAmax(int m, int n, T const* input,
+    float* blockMaxBuf, float* output, int* retirementCount,
+    float quantRange, float eps,
+    int multiProcessorCount, cudaStream_t stream = 0);
+
 } // namespace kernels
  
  TRTLLM_NAMESPACE_END

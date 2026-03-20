@@ -13,3 +13,10 @@
 # limitations under the License.
 
 from tllm_linear_lite.amax.triton_amax import triton_amax, triton_amax_partial  # noqa: F401
+from tllm_linear_lite.amax.cuda_amax import cuda_amax, cuda_prologue  # noqa: F401
+
+try:
+    from tllm_linear_lite.amax.cutedsl_amax import cutedsl_amax, CUTEDSL_AMAX_AVAILABLE  # noqa: F401
+except ImportError:
+    cutedsl_amax = None  # type: ignore[assignment]
+    CUTEDSL_AMAX_AVAILABLE = False

@@ -51,7 +51,7 @@ import nvtx
 # Load tllm_linear_lite CUDA extension
 import tllm_linear_lite  # noqa: F401
 from tllm_linear_lite.quantize import FOUROVERSIX_AVAILABLE, fp4_quantize as fp4_quantize_unified
-from tllm_linear_lite.amax.triton_amax import triton_amax
+from tllm_linear_lite.amax.cuda_amax import cuda_prologue
 
 
 # ============================================================================
@@ -247,12 +247,25 @@ def quantize(
         act_fp4: Quantized FP4 tensor (packed uint8)
         act_sf: Scale factor tensor (FP8 E4M3 as uint8)
     """
-    act_global_scale = 448.0 * 6.0 / input_tensor.abs().amax().float()
+    _amax, act_global_scale = cuda_prologue(input_tensor)
     scaling_vector_size = 16
     act_fp4, act_sf = torch.ops.tllm_linear_lite.fp4_quantize(
         input_tensor, act_global_scale, scaling_vector_size, False, swizzled
     )
     return act_fp4, act_sf
+
+
+def _fast_prologue(
+    x: torch.Tensor,
+    quant_range: float = 448.0 * 6.0,
+    eps: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute (amax, global_scale) using a single CUDA kernel.
+
+    Replaces the previous triton_amax / abs().max() dispatch with the fused
+    cuda_prologue kernel (single launch, all M sizes).
+    """
+    return cuda_prologue(x, quant_range=quant_range, eps=eps)
 
 
 def measure_scale_computation(
@@ -261,10 +274,7 @@ def measure_scale_computation(
     warmup: int = 3,
     repeat: int = 10,
 ) -> Tuple[float, float]:
-    """Measure the time for global scale computation (triton_amax + division).
-
-    Uses triton_amax (Triton partial reduction + PyTorch .max() final) instead
-    of the naive abs().amax() path.
+    """Measure the time for global scale computation via cuda_prologue.
 
     Args:
         input_tensor: Input tensor.
@@ -277,7 +287,7 @@ def measure_scale_computation(
     """
     with nvtx.annotate("scale_computation/warmup"):
         for _ in range(warmup):
-            _ = quant_range / triton_amax(input_tensor)
+            _fast_prologue(input_tensor, quant_range)
         torch.cuda.synchronize()
 
     times = []
@@ -288,7 +298,7 @@ def measure_scale_computation(
 
             rng = nvtx.start_range(f"scale_computation/iter_{i}")
             start.record()
-            act_global_scale = quant_range / triton_amax(input_tensor)
+            _amax, act_global_scale = _fast_prologue(input_tensor, quant_range)
             end.record()
             nvtx.end_range(rng)
 
@@ -673,7 +683,7 @@ def benchmark(
         peak_bw = 2.0  # conservative estimate
 
     # ================================================================
-    # tllm baseline: prologue (triton_amax) + kernel, measured both ways
+    # tllm baseline: prologue (cuda_prologue) + kernel, measured both ways
     # ================================================================
     from tllm_linear_lite.quantize import (
         _SCALE_RULE_MAP, _TLLM_QUANT_RANGE, _FOUROVERSIX_QUANT_RANGE,
@@ -699,7 +709,7 @@ def benchmark(
     total_bytes = data_bytes + output_bytes
 
     # ================================================================
-    # tllm adaptive 4/6: end-to-end (triton_amax → scale → kernel)
+    # tllm adaptive 4/6: end-to-end (cuda_prologue → scale → kernel)
     # ================================================================
     _ADAPTIVE_RULES = ("mse", "abs_max", "mae")
     adaptive_kernel_times: dict[str, float] = {}
@@ -710,9 +720,8 @@ def benchmark(
             scale_rule_int = _SCALE_RULE_MAP[rule]
             scaling_vector_size = 16
 
-            # Kernel-only timing (scale precomputed)
-            adaptive_global_scale = (_FOUROVERSIX_QUANT_RANGE / triton_amax(input_tensor)).item()
-            adaptive_gs_tensor = torch.tensor(adaptive_global_scale, dtype=torch.float32, device=input_tensor.device)
+            # Kernel-only timing (scale precomputed via cuda_prologue)
+            _adapt_amax, adaptive_gs_tensor = _fast_prologue(input_tensor, _FOUROVERSIX_QUANT_RANGE)
 
             with nvtx.annotate(f"benchmark/tllm_{rule}/warmup"):
                 for _ in range(warmup):
@@ -740,11 +749,10 @@ def benchmark(
 
             adaptive_kernel_times[rule] = sum(kernel_times) / len(kernel_times)
 
-            # End-to-end timing (triton_amax → scale → kernel)
+            # End-to-end timing (cuda_prologue → kernel)
             with nvtx.annotate(f"benchmark/tllm_{rule}/e2e_warmup"):
                 for _ in range(warmup):
-                    gs = _FOUROVERSIX_QUANT_RANGE / triton_amax(input_tensor)
-                    gs_t = torch.tensor(gs.item(), dtype=torch.float32, device=input_tensor.device)
+                    _a, gs_t = _fast_prologue(input_tensor, _FOUROVERSIX_QUANT_RANGE)
                     _ = torch.ops.tllm_linear_lite.fp4_quantize(
                         input_tensor, gs_t, scaling_vector_size, False, True,
                         1, scale_rule_int,
@@ -758,8 +766,7 @@ def benchmark(
                     end = torch.cuda.Event(enable_timing=True)
                     rng = nvtx.start_range(f"tllm_{rule}/e2e_{i}")
                     start.record()
-                    gs = _FOUROVERSIX_QUANT_RANGE / triton_amax(input_tensor)
-                    gs_t = torch.tensor(gs.item(), dtype=torch.float32, device=input_tensor.device)
+                    _a, gs_t = _fast_prologue(input_tensor, _FOUROVERSIX_QUANT_RANGE)
                     _ = torch.ops.tllm_linear_lite.fp4_quantize(
                         input_tensor, gs_t, scaling_vector_size, False, True,
                         1, scale_rule_int,
@@ -1042,7 +1049,8 @@ def main():
                 f46_dq = f46_dq[:input_flat.shape[0], :input_flat.shape[1]]
 
             # tllm adaptive dequant
-            gs = (6.0 * 256.0 / triton_amax(input_tensor)).item()
+            _a, gs_t = _fast_prologue(input_tensor, 6.0 * 256.0)
+            gs = gs_t.item()
             fp4_f, sf_f = unpack_cuda_fp4_output(
                 *fp4_quantize_unified(input_tensor, backend="tllm", swizzled=False, scale_rule=rule),
                 M, K, 16

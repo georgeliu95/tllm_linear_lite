@@ -293,6 +293,106 @@ at::Tensor calculate_nvfp4_global_scale(
 }
 
 // ---------------------------------------------------------------------------
+// calculate_global_amax
+// ---------------------------------------------------------------------------
+
+/// Compute global absolute maximum across all elements of a 2-D tensor.
+/// TRUE single kernel launch — no zero-init, no extra kernels.
+///
+/// Uses last-block reduction pattern: each block writes per-block max to a
+/// temp buffer, then the last block (detected via atomic counter) reduces
+/// all per-block maxes into a single scalar.
+///
+/// All internal buffers are pre-allocated on first call and reused.
+///
+/// @param input  Input tensor [M, K], fp16/bf16
+/// @param output Optional pre-allocated [1] float32 tensor for the result.
+///               If nullopt, uses an internal persistent buffer.
+/// @return       Scalar float32 tensor containing max(|input|)
+/// Compute global amax (and optionally global_scale) in a TRUE single kernel.
+///
+/// output[0] = max(|input|) clamped to >= eps
+/// output[1] = quantRange / output[0]   (if quantRange > 0)
+///           = output[0]                 (if quantRange == 0)
+///
+/// @param input      Input tensor [M, K], fp16/bf16
+/// @param quantRange If > 0, fuse the division into the kernel.  2688.0 for NVFP4.
+/// @param eps        Floor for amax to prevent division by zero. Default 1e-12.
+/// @return           [2] float32 tensor: [amax, global_scale]
+at::Tensor calculate_global_amax(
+    at::Tensor const& input,
+    double quantRange,
+    double eps)
+{
+    CHECK_TH_CUDA(input);
+    CHECK_CONTIGUOUS(input);
+
+    auto const& inputShape = input.sizes();
+    auto const rank = inputShape.size();
+    TORCH_CHECK(rank >= 2, "Input must be >= 2D tensor.");
+
+    int64_t m = 1;
+    for (size_t i = 0; i < rank - 1; i++)
+    {
+        m *= inputShape[i];
+    }
+    auto const n = inputShape[rank - 1];
+
+    static int multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+    int maxGridX = std::min(static_cast<int>(m), multiProcessorCount * 4);
+
+    // Persistent internal buffers — allocated once, reused across calls.
+    static at::Tensor blockMaxBuf;
+    static at::Tensor retirementCount;
+    static at::Tensor outputBuf;
+    static int allocatedGridX = 0;
+
+    if (allocatedGridX < maxGridX)
+    {
+        auto opts = input.options();
+        blockMaxBuf = at::empty({maxGridX}, opts.dtype(torch::kFloat32));
+        outputBuf = at::empty({2}, opts.dtype(torch::kFloat32));
+        retirementCount = at::zeros({1}, opts.dtype(torch::kInt32));
+        allocatedGridX = maxGridX;
+    }
+
+    auto stream = at::cuda::getCurrentCUDAStream(input.get_device()).stream();
+
+    if (input.scalar_type() == at::ScalarType::Half)
+    {
+        tensorrt_llm::kernels::computeGlobalAmax<half>(
+            m, n,
+            reinterpret_cast<half const*>(input.data_ptr()),
+            blockMaxBuf.data_ptr<float>(),
+            outputBuf.data_ptr<float>(),
+            retirementCount.data_ptr<int>(),
+            static_cast<float>(quantRange), static_cast<float>(eps),
+            multiProcessorCount, stream);
+    }
+    else if (input.scalar_type() == at::ScalarType::BFloat16)
+    {
+#ifdef ENABLE_BF16
+        tensorrt_llm::kernels::computeGlobalAmax<__nv_bfloat16>(
+            m, n,
+            reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
+            blockMaxBuf.data_ptr<float>(),
+            outputBuf.data_ptr<float>(),
+            retirementCount.data_ptr<int>(),
+            static_cast<float>(quantRange), static_cast<float>(eps),
+            multiProcessorCount, stream);
+#else
+        TORCH_CHECK(false, "BFloat16 support not enabled at build time.");
+#endif
+    }
+    else
+    {
+        TORCH_CHECK(false, "calculate_global_amax only supports fp16/bf16 input.");
+    }
+
+    return outputBuf;
+}
+
+// ---------------------------------------------------------------------------
 // Op registration
 // ---------------------------------------------------------------------------
 
@@ -303,10 +403,12 @@ TORCH_LIBRARY_FRAGMENT(tllm_linear_lite, m)
         "bool sfUseUE8M0=False, bool isSfSwizzledLayout=True, "
         "int kernelVersion=1, int scaleRule=0) -> (Tensor, Tensor)");
     m.def("calculate_nvfp4_global_scale(Tensor input, Tensor? tokensPerBatch) -> Tensor");
+    m.def("calculate_global_amax(Tensor input, float quantRange=0.0, float eps=1e-12) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(tllm_linear_lite, CUDA, m)
 {
     m.impl("fp4_quantize", &fp4_quantize);
     m.impl("calculate_nvfp4_global_scale", &calculate_nvfp4_global_scale);
+    m.impl("calculate_global_amax", &calculate_global_amax);
 }
